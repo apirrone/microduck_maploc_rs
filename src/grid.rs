@@ -37,10 +37,11 @@ pub struct GridConfig {
 
 impl Default for GridConfig {
     fn default() -> Self {
-        // Matches the Python defaults used in the simulator.
+        // Matches the Python sim defaults — sized for the 8×6 m
+        // apartment with margin on all sides.
         Self {
-            x_range: (-3.0, 3.5),
-            y_range: (-2.5, 2.5),
+            x_range: (-4.5, 4.5),
+            y_range: (-3.5, 3.5),
             cell:    0.05,
         }
     }
