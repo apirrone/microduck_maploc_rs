@@ -10,6 +10,9 @@ name = "microduck_maploc"
 path = "src/lib.rs"
 
 [dependencies]
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+rand_distr = "0.4"
+rayon = "1.10"
 
 [dev-dependencies]
 

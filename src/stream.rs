@@ -17,7 +17,7 @@
 //! drain inbound goals. Network errors deliberately fall through as
 //! "client gone" rather than killing the runtime.
 
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 
@@ -143,7 +143,7 @@ impl GoalServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::time::{Duration, Instant};
 

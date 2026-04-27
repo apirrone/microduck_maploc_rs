@@ -12,11 +12,15 @@
 //! so a Pi-side runtime can persist the map between boots without
 //! pulling in a serialization framework.
 
+pub mod follower;
 pub mod grid;
+pub mod mcl;
 pub mod planner;
 pub mod stream;
 pub mod wire;
 
+pub use follower::{follow_step, FollowCommand, FollowerState};
 pub use grid::{GridConfig, OccupancyGrid};
+pub use mcl::{Localizer, MclConfig, Particle};
 pub use planner::{plan, PlannerConfig};
 pub use wire::{Goal, LockState, Message, Path as WirePath, Pose, Scan};
