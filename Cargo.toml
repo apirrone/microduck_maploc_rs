@@ -1,0 +1,18 @@
+[package]
+name = "microduck_maploc"
+version = "0.1.0"
+edition = "2021"
+description = "ToF-based 2D occupancy mapping + MCL localization for the microduck robot"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "microduck_maploc"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
