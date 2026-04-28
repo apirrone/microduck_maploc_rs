@@ -22,7 +22,16 @@ use rand::distributions::Distribution;
 use rand_distr::Normal;
 use rayon::prelude::*;
 
+use crate::accumulator::BufferedBeam;
 use crate::grid::OccupancyGrid;
+
+#[inline]
+fn wrap_pi(a: f32) -> f32 {
+    let mut x = a;
+    while x >  PI { x -= 2.0 * PI; }
+    while x < -PI { x += 2.0 * PI; }
+    x
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct MclConfig {
@@ -45,14 +54,20 @@ pub struct MclConfig {
     /// at max_range — they carry no localization signal.
     pub skip_max_margin: f32,
     pub neff_threshold_frac: f32,
-    // Augmented MCL — searching mode (cloud dispersed): inject every tick.
-    pub inject_std_m:    f32,
-    pub inject_resid_m:  f32,
-    pub inject_frac_max: f32,
-    // Tracking mode (cloud tight): only inject after sustained catastrophe.
-    pub track_resid_catastrophe_m: f32,
-    pub track_inject_frac:         f32,
-    pub track_catastrophe_persist: u32,
+    // Textbook augmented-MCL (Thrun et al., Probabilistic Robotics §8.3.7).
+    // Track slow / fast EWMAs of the average particle weight; whenever
+    // `w_fast` drops well below `w_slow` it means the recent fit just got
+    // noticeably worse than the long-term baseline (= we got lost). The
+    // injection probability per particle is max(0, 1 - w_fast/w_slow),
+    // which auto-decays once `w_slow` catches up — no manual thresholds.
+    pub alpha_slow: f32,
+    pub alpha_fast: f32,
+    /// Cap injection per resample step. Never replace 100% — we'd lose
+    /// any tracking info. ~50% leaves room for a correct cluster to win
+    /// back the population once it's sampled.
+    pub max_inject_frac: f32,
+    /// Reserved (kept for parity with Python's call sites).
+    pub inject_std_m: f32,
 }
 
 impl Default for MclConfig {
@@ -69,12 +84,41 @@ impl Default for MclConfig {
             beam_logw_floor: -2.5,
             skip_max_margin: 0.10,
             neff_threshold_frac: 0.5,
+            alpha_slow: 0.02,
+            alpha_fast: 0.30,
+            max_inject_frac: 0.50,
             inject_std_m:    0.30,
-            inject_resid_m:  0.20,
-            inject_frac_max: 0.40,
-            track_resid_catastrophe_m: 1.5,
-            track_inject_frac:         0.05,
-            track_catastrophe_persist: 8,
+        }
+    }
+}
+
+/// Parameters for `Localizer::global_relocalize_field`. Defaults match
+/// the Python sim's `Localizer.global_relocalize_field` parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldRelocConfig {
+    pub cell_subsample: u32,
+    pub n_yaw_bins:     u32,
+    pub beam_subsample: u32,
+    pub sigma_m:        f32,
+    pub top_k_frac:     f32,
+    pub jitter_xy:      f32,
+    pub jitter_yaw:     f32,
+    /// Distance-field threshold in fixed-point. 150 = log_odds 1.5
+    /// (≈2 confirmed hits) — matches the Python planner / relocalize.
+    pub occ_threshold_fp: i16,
+}
+
+impl Default for FieldRelocConfig {
+    fn default() -> Self {
+        Self {
+            cell_subsample: 3,
+            n_yaw_bins:     24,
+            beam_subsample: 32,
+            sigma_m:        0.20,
+            top_k_frac:     0.005,
+            jitter_xy:      0.05,
+            jitter_yaw:     0.10,
+            occ_threshold_fp: 150,
         }
     }
 }
@@ -89,7 +133,11 @@ pub struct Localizer {
     weights:    Vec<f32>,
     rng:        StdRng,
     last_residual_m: f32,
-    catastrophe_count: u32,
+    /// EWMAs of the average particle weight per update — the textbook
+    /// augmented-MCL lost-detection signal.
+    w_slow: f32,
+    w_fast: f32,
+    w_avg_initialized: bool,
 }
 
 impl Localizer {
@@ -101,7 +149,9 @@ impl Localizer {
             weights:   vec![1.0 / n as f32; n],
             rng:       StdRng::seed_from_u64(rng_seed),
             last_residual_m: f32::NAN,
-            catastrophe_count: 0,
+            w_slow: 0.0,
+            w_fast: 0.0,
+            w_avg_initialized: false,
         };
         s.reset_uniform(grid);
         s
@@ -136,7 +186,12 @@ impl Localizer {
             self.particles[k] = Particle { x, y, yaw };
         }
         self.weights.iter_mut().for_each(|w| *w = 1.0 / n as f32);
-        self.catastrophe_count = 0;
+        // New cloud → forget the old fit-quality EWMA so the next update
+        // seeds them fresh and we don't immediately fire injection on
+        // the first tick.
+        self.w_avg_initialized = false;
+        self.w_slow = 0.0;
+        self.w_fast = 0.0;
     }
 
     /// Tight cluster around a known pose (e.g. on dock undocking).
@@ -153,7 +208,12 @@ impl Localizer {
             };
         }
         self.weights.iter_mut().for_each(|w| *w = 1.0 / n as f32);
-        self.catastrophe_count = 0;
+        // New cloud → forget the old fit-quality EWMA so the next update
+        // seeds them fresh and we don't immediately fire injection on
+        // the first tick.
+        self.w_avg_initialized = false;
+        self.w_slow = 0.0;
+        self.w_fast = 0.0;
     }
 
     // ── Predict ────────────────────────────────────────────────────────────
@@ -242,15 +302,31 @@ impl Localizer {
 
         // Normalize weights via subtract-max + exp.
         let log_w_max = log_w.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        for (w, lw) in self.weights.iter_mut().zip(&log_w) {
-            *w = (*lw - log_w_max).exp();
+        let mut w_unnorm = vec![0.0_f32; n];
+        for (i, &lw) in log_w.iter().enumerate() {
+            w_unnorm[i] = (lw - log_w_max).exp();
         }
-        let s: f32 = self.weights.iter().sum();
+        let s: f32 = w_unnorm.iter().sum();
         if !(s > 0.0 && s.is_finite()) {
             self.last_residual_m = f32::NAN;
             return;
         }
-        for w in self.weights.iter_mut() { *w /= s; }
+        // Textbook augmented-MCL: track average particle weight (post-
+        // max-subtract — bounded in (0, 1]) on slow + fast EWMAs. A
+        // sustained drop in `w_fast` relative to `w_slow` means the
+        // recent fit is much worse than the long-term baseline → lost.
+        let w_avg = s / n as f32;
+        if !self.w_avg_initialized {
+            self.w_slow = w_avg;
+            self.w_fast = w_avg;
+            self.w_avg_initialized = true;
+        } else {
+            self.w_slow += cfg.alpha_slow * (w_avg - self.w_slow);
+            self.w_fast += cfg.alpha_fast * (w_avg - self.w_fast);
+        }
+        for (w, &u) in self.weights.iter_mut().zip(w_unnorm.iter()) {
+            *w = u / s;
+        }
 
         // Clean residual: best particle's RMS error over known beams only.
         let best = self.weights.iter()
@@ -274,29 +350,279 @@ impl Localizer {
             self.systematic_resample();
         }
 
-        // Two-mode injection — searching vs tracking with persistence.
-        let std_now = self.position_std();
-        if !self.last_residual_m.is_finite() { return; }
-        if std_now > cfg.inject_std_m {
-            // SEARCHING — inject every tick proportional to residual ramp.
-            if self.last_residual_m > cfg.inject_resid_m {
-                let ramp = (self.last_residual_m - cfg.inject_resid_m) / cfg.inject_resid_m;
-                let frac = (cfg.inject_frac_max * ramp).min(cfg.inject_frac_max);
-                self.inject_random(grid, (frac * n as f32) as usize);
-            }
-            self.catastrophe_count = 0;
+        // Augmented-MCL injection: probabilistic, capped, no manual gates.
+        // p_inject per particle = max(0, 1 - w_fast/w_slow). When the
+        // filter is well-locked, w_fast ≈ w_slow → no injection. When
+        // the recent fit dips (kidnap, walking off the mapped region,
+        // etc.), w_fast drops faster than w_slow → some particles get
+        // replaced with random samples. Once w_slow catches up, tapers.
+        let p_inject = if self.w_slow > 0.0 {
+            (1.0 - self.w_fast / self.w_slow).max(0.0)
+        } else { 0.0 };
+        let n_inject = (p_inject * n as f32) as usize;
+        let cap = (cfg.max_inject_frac * n as f32) as usize;
+        let n_inject = n_inject.min(cap);
+        if n_inject > 0 {
+            self.inject_random(grid, n_inject);
+        }
+    }
+
+    // ── Update from accumulated wide scan ──────────────────────────────────
+
+    /// MCL update from a buffered wide scan (multiple viewpoints).
+    /// Each beam uses the localizer's belief at capture to compute
+    /// per-particle pose-at-capture under the constant-offset
+    /// approximation. Mirrors the Python `Localizer.update_accumulated`.
+    pub fn update_accumulated(
+        &mut self,
+        grid: &OccupancyGrid,
+        beams: &[BufferedBeam],
+        current_est_pose: (f32, f32, f32),
+    ) {
+        if beams.is_empty() { return; }
+        let cfg = self.cfg;
+        let z_near = cfg.z_max - cfg.skip_max_margin;
+        let sig2 = 2.0 * cfg.beam_sigma * cfg.beam_sigma;
+
+        // Subsample buffered beams. ~32 strided beams keep wide
+        // diversity while bounding the per-flush cost.
+        const MAX_BEAMS_IN_UPDATE: usize = 32;
+        let beams_used: Vec<&BufferedBeam> = if beams.len() > MAX_BEAMS_IN_UPDATE {
+            let stride = (beams.len() / MAX_BEAMS_IN_UPDATE).max(1);
+            beams.iter().step_by(stride).take(MAX_BEAMS_IN_UPDATE).collect()
         } else {
-            // TRACKING — only after sustained catastrophe.
-            if self.last_residual_m > cfg.track_resid_catastrophe_m {
-                self.catastrophe_count += 1;
-            } else {
-                self.catastrophe_count = 0;
-            }
-            if self.catastrophe_count >= cfg.track_catastrophe_persist {
-                self.inject_random(grid, (cfg.track_inject_frac * n as f32) as usize);
-                self.catastrophe_count = 0;
+            beams.iter().collect()
+        };
+
+        let (cur_x, cur_y, cur_yaw) = current_est_pose;
+        let n = self.cfg.n_particles;
+        let mut log_w = vec![0.0_f32; n];
+
+        // Cache (beam, pred-per-particle) for the post-update residual.
+        let mut scored: Vec<(&BufferedBeam, Vec<f32>)> = Vec::with_capacity(beams_used.len());
+        for beam in beams_used {
+            if beam.range_m >= z_near { continue; }
+            let dx_off   = beam.est_origin.0 - cur_x;
+            let dy_off   = beam.est_origin.1 - cur_y;
+            let dyaw_off = wrap_pi(beam.est_yaw - cur_yaw);
+            let pred: Vec<f32> = self.particles.par_iter().map(|p| {
+                let px = p.x + dx_off;
+                let py = p.y + dy_off;
+                let theta = p.yaw + dyaw_off + beam.angle_body;
+                grid.cast_ray(px, py, theta, cfg.z_max)
+            }).collect();
+            log_w.iter_mut().zip(&pred).for_each(|(lw, &pp)| {
+                let cost = if pp >= z_near {
+                    -cfg.beam_logw_floor
+                } else {
+                    let d = pp - beam.range_m;
+                    d * d / sig2
+                };
+                *lw -= cost;
+            });
+            scored.push((beam, pred));
+        }
+        if scored.is_empty() { return; }
+
+        let log_w_max = log_w.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        for (w, lw) in self.weights.iter_mut().zip(&log_w) {
+            *w = (*lw - log_w_max).exp();
+        }
+        let s: f32 = self.weights.iter().sum();
+        if !(s > 0.0 && s.is_finite()) {
+            self.last_residual_m = f32::NAN;
+            return;
+        }
+        for w in self.weights.iter_mut() { *w /= s; }
+
+        // Clean residual: best particle's RMS error over known beams.
+        let best = self.weights.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let (mut sq, mut n_known) = (0.0_f32, 0u32);
+        for (beam, pred) in &scored {
+            let p_b = pred[best];
+            if p_b >= z_near { continue; }
+            let d = p_b - beam.range_m;
+            sq += d * d;
+            n_known += 1;
+        }
+        self.last_residual_m = if n_known > 0 {
+            (sq / n_known as f32).sqrt()
+        } else { f32::NAN };
+
+        if self.neff() < cfg.neff_threshold_frac * n as f32 {
+            self.systematic_resample();
+        }
+
+        // Wide-scan flush failed to find a good fit → re-disperse.
+        const WIDE_RESID_BAD_M: f32 = 0.50;
+        if self.last_residual_m.is_finite() && self.last_residual_m > WIDE_RESID_BAD_M {
+            self.inject_random(grid, n / 2);
+        }
+    }
+
+    // ── Global relocalize (likelihood field) ───────────────────────────────
+
+    /// Coarse global scan-match using the precomputed distance field.
+    ///
+    /// Replaces the particle cloud with samples drawn from the top-K
+    /// hypotheses on a (free-cell × yaw) grid, scored against the
+    /// accumulated wide scan with the textbook field model
+    /// `exp(-d² / 2σ²)` where `d` is the distance from each beam's
+    /// endpoint to the nearest mapped obstacle. This is the kidnap
+    /// recovery primitive — cheap (one O(1) lookup per beam per
+    /// hypothesis instead of an 80-step ray march), so we can call it
+    /// after every accumulator flush while lost.
+    ///
+    /// Defaults match the Python `Localizer.global_relocalize_field`
+    /// in `microduck_maploc/sim/localizer.py`.
+    pub fn global_relocalize_field(
+        &mut self,
+        grid: &mut OccupancyGrid,
+        beams: &[BufferedBeam],
+        current_est_pose: (f32, f32, f32),
+    ) {
+        self.global_relocalize_field_with(
+            grid, beams, current_est_pose,
+            FieldRelocConfig::default(),
+        );
+    }
+
+    pub fn global_relocalize_field_with(
+        &mut self,
+        grid: &mut OccupancyGrid,
+        beams: &[BufferedBeam],
+        current_est_pose: (f32, f32, f32),
+        params: FieldRelocConfig,
+    ) {
+        if beams.is_empty() { return; }
+        let cfg = self.cfg;
+        let z_near = cfg.z_max - cfg.skip_max_margin;
+
+        // Hypothesis grid (free cells × yaw bins), subsampled.
+        let mut free_cells = collect_free_cells(grid);
+        if free_cells.is_empty() { return; }
+        if params.cell_subsample > 1 {
+            free_cells = free_cells.into_iter()
+                .step_by(params.cell_subsample as usize).collect();
+        }
+        let n_cells = free_cells.len();
+        let n_yaw = params.n_yaw_bins as usize;
+        let n_hyp = n_cells * n_yaw;
+        let cell = grid.cell();
+        let cfg_g = grid.cfg();
+        let x0 = cfg_g.x_range.0;
+        let y0 = cfg_g.y_range.0;
+        let mut hx  = vec![0.0_f32; n_hyp];
+        let mut hy  = vec![0.0_f32; n_hyp];
+        let mut hyw = vec![0.0_f32; n_hyp];
+        for j in 0..n_yaw {
+            let yaw_b = (j as f32 + 0.5) * (2.0 * PI / n_yaw as f32) - PI;
+            for (k, &(i, c)) in free_cells.iter().enumerate() {
+                let idx = j * n_cells + k;
+                hx[idx]  = x0 + (c as f32 + 0.5) * cell;
+                hy[idx]  = y0 + (i as f32 + 0.5) * cell;
+                hyw[idx] = yaw_b;
             }
         }
+
+        // Beam subsample — global match doesn't need every beam.
+        let beams_used: Vec<&BufferedBeam> = if beams.len() > params.beam_subsample as usize {
+            let stride = (beams.len() / params.beam_subsample as usize).max(1);
+            beams.iter().step_by(stride).take(params.beam_subsample as usize).collect()
+        } else {
+            beams.iter().collect()
+        };
+
+        let (cur_x, cur_y, cur_yaw) = current_est_pose;
+        // Snapshot grid metadata BEFORE the mut-borrowing distance_field
+        // call — we can't immutably reach into `grid` while the field
+        // slice is alive.
+        let h = grid.height();
+        let w = grid.width();
+        let field = grid.distance_field(params.occ_threshold_fp);
+        let cell_inv = 1.0 / cell;
+        let sig2 = 2.0 * params.sigma_m * params.sigma_m;
+
+        let mut log_w = vec![0.0_f64; n_hyp];
+        let unmapped_d = params.sigma_m * 3.0;   // out-of-bounds penalty distance
+        for beam in &beams_used {
+            if beam.range_m >= z_near { continue; }
+            let dx_off   = beam.est_origin.0 - cur_x;
+            let dy_off   = beam.est_origin.1 - cur_y;
+            let dyaw_off = wrap_pi(beam.est_yaw - cur_yaw);
+            for k in 0..n_hyp {
+                let theta = hyw[k] + dyaw_off + beam.angle_body;
+                let ex = (hx[k] + dx_off) + beam.range_m * theta.cos();
+                let ey = (hy[k] + dy_off) + beam.range_m * theta.sin();
+                let jj = ((ex - x0) * cell_inv) as i32;
+                let ii = ((ey - y0) * cell_inv) as i32;
+                let d = if ii >= 0 && jj >= 0 && (ii as usize) < h && (jj as usize) < w {
+                    field[(ii as usize) * w + (jj as usize)]
+                } else {
+                    unmapped_d
+                };
+                log_w[k] -= (d as f64) * (d as f64) / (sig2 as f64);
+            }
+        }
+
+        // Normalise via subtract-max + exp.
+        let log_w_max = log_w.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let mut w: Vec<f64> = log_w.iter().map(|lw| (*lw - log_w_max).exp()).collect();
+        let s: f64 = w.iter().sum();
+        if !(s > 0.0 && s.is_finite()) { return; }
+        for v in w.iter_mut() { *v /= s; }
+
+        // Sample new particles from the top-K hypotheses, weighted.
+        let n = self.cfg.n_particles;
+        let k = (50_usize).max(((params.top_k_frac as f64 * n_hyp as f64) as usize).min(n_hyp));
+        let mut indexed: Vec<(usize, f64)> = (0..n_hyp).map(|i| (i, w[i])).collect();
+        // Partial sort: pick top-k by weight (descending). For small k vs n_hyp
+        // a heap or quickselect would be faster; std's `select_nth_unstable_by`
+        // gives us O(n) selection.
+        if k < n_hyp {
+            indexed.select_nth_unstable_by(n_hyp - k, |a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        let top: Vec<(usize, f64)> = indexed.into_iter().rev().take(k).collect();
+        let top_sum: f64 = top.iter().map(|(_, w)| *w).sum();
+        if !(top_sum > 0.0) { return; }
+        let mut cum = Vec::with_capacity(top.len());
+        let mut acc = 0.0_f64;
+        for (_, w) in &top {
+            acc += w / top_sum;
+            cum.push(acc);
+        }
+
+        let xy_noise  = Normal::new(0.0_f64, params.jitter_xy as f64).unwrap();
+        let yaw_noise = Normal::new(0.0_f64, params.jitter_yaw as f64).unwrap();
+        for slot in 0..n {
+            let r: f64 = self.rng.gen();
+            // Sequential search through CDF — short array (k ≤ a few thousand).
+            let pos = cum.partition_point(|c| *c < r).min(top.len() - 1);
+            let h_idx = top[pos].0;
+            let jx: f64 = xy_noise.sample(&mut self.rng);
+            let jy: f64 = xy_noise.sample(&mut self.rng);
+            let jyaw: f64 = yaw_noise.sample(&mut self.rng);
+            let mut yaw = hyw[h_idx] + jyaw as f32;
+            yaw = ((yaw + PI).rem_euclid(2.0 * PI)) - PI;
+            self.particles[slot] = Particle {
+                x:   hx[h_idx] + jx as f32,
+                y:   hy[h_idx] + jy as f32,
+                yaw,
+            };
+        }
+        let inv = 1.0 / n as f32;
+        for w_p in self.weights.iter_mut() { *w_p = inv; }
+        // Reset augmented-MCL EWMAs so the new cloud isn't immediately
+        // judged "lost" against an old fit baseline.
+        self.w_avg_initialized = false;
+        self.w_slow = 0.0;
+        self.w_fast = 0.0;
     }
 
     // ── Estimates ──────────────────────────────────────────────────────────
@@ -323,6 +649,23 @@ impl Localizer {
             var += w * (dx * dx + dy * dy);
         }
         var.max(0.0).sqrt()
+    }
+
+    /// UNweighted xy std — physical particle dispersion. Right "are we
+    /// lost?" signal: stays large until resample has actually collapsed
+    /// the cloud, regardless of how spiky the weights are.
+    pub fn cloud_spread(&self) -> f32 {
+        let n = self.particles.len() as f32;
+        if n == 0.0 { return 0.0; }
+        let mut mx = 0.0_f32; let mut my = 0.0_f32;
+        for p in &self.particles { mx += p.x; my += p.y; }
+        mx /= n; my /= n;
+        let mut var = 0.0_f32;
+        for p in &self.particles {
+            let dx = p.x - mx; let dy = p.y - my;
+            var += dx * dx + dy * dy;
+        }
+        (var / n).max(0.0).sqrt()
     }
 
     // ── Internals ──────────────────────────────────────────────────────────
@@ -468,6 +811,30 @@ mod tests {
         let (bx, by, _) = loc.best();
         let err = (bx * bx + by * by).sqrt();
         assert!(err < 0.10, "estimate should drift toward truth, got ({bx}, {by})");
+    }
+
+    #[test]
+    fn global_relocalize_field_runs_and_seeds_particles() {
+        // Build a small mapped room, run global_relocalize_field with
+        // a fake wide scan, verify particles land in the mapped area.
+        let mut g = small_grid_with_walls();
+        let mut loc = Localizer::new(&g, MclConfig { n_particles: 200, ..MclConfig::default() }, 3);
+        // Fake beams: synthesise them from cast_ray at the origin.
+        let mut beams: Vec<BufferedBeam> = Vec::new();
+        for k in 0..16 {
+            let a = -std::f32::consts::PI + (k as f32) * (std::f32::consts::PI / 8.0);
+            let r = g.cast_ray(0.0, 0.0, a, 4.0);
+            beams.push(BufferedBeam {
+                angle_body: a, range_m: r,
+                est_origin: (0.0, 0.0), est_yaw: 0.0,
+            });
+        }
+        loc.global_relocalize_field(&mut g, &beams, (0.0, 0.0, 0.0));
+        // Particles should now cluster within the apartment bounds.
+        for p in loc.particles() {
+            assert!(p.x >= -0.8 && p.x <= 0.8, "x out of bounds: {}", p.x);
+            assert!(p.y >= -0.8 && p.y <= 0.8, "y out of bounds: {}", p.y);
+        }
     }
 
     #[test]

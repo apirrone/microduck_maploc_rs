@@ -54,13 +54,26 @@ pub struct OccupancyGrid {
     w: usize,
     h: usize,
     log: Vec<i16>,
+    /// Cached distance-to-nearest-obstacle field in metres, lazy.
+    /// Re-computed by `distance_field()` after a map mutation flips the
+    /// dirty flag. Mirrors the Python sim's caching so the per-update
+    /// cost is amortized.
+    field: Option<Vec<f32>>,
+    field_threshold_fp: i16,
+    field_dirty: bool,
 }
 
 impl OccupancyGrid {
     pub fn new(cfg: GridConfig) -> Self {
         let w = ((cfg.x_range.1 - cfg.x_range.0) / cfg.cell).ceil() as usize;
         let h = ((cfg.y_range.1 - cfg.y_range.0) / cfg.cell).ceil() as usize;
-        Self { cfg, w, h, log: vec![0; w * h] }
+        Self {
+            cfg, w, h,
+            log: vec![0; w * h],
+            field: None,
+            field_threshold_fp: 0,
+            field_dirty: true,
+        }
     }
 
     pub fn cfg(&self) -> &GridConfig { &self.cfg }
@@ -114,6 +127,7 @@ impl OccupancyGrid {
     /// iff `hit_is_occupied` (e.g. ray hit a wall, not the floor).
     pub fn integrate_ray(&mut self, x0: f32, y0: f32,
                          x1: f32, y1: f32, hit_is_occupied: bool) {
+        self.field_dirty = true;
         let cell = self.cfg.cell;
         let i0 = ((y0 - self.cfg.y_range.0) / cell) as i32;
         let j0 = ((x0 - self.cfg.x_range.0) / cell) as i32;
@@ -153,6 +167,72 @@ impl OccupancyGrid {
             }
         }
         max_range
+    }
+
+    // ── Distance field (likelihood-field measurement model) ───────────
+
+    /// Distance (in metres) from each grid cell to the nearest cell
+    /// whose log-odds exceed `occ_threshold_fp`. Lazy + cached: the
+    /// dirty flag is flipped on `integrate_ray`, so the first call after
+    /// any map update recomputes and subsequent calls are O(1) clone-free.
+    ///
+    /// Algorithm: Felzenszwalb 2D Euclidean distance transform (separable
+    /// 1D parabola-envelope sweep applied row-wise then column-wise) —
+    /// O(W*H), no approximation. ~5 ms on the apartment grid in Rust;
+    /// drives the global scan-match in `Localizer::global_relocalize_field`.
+    pub fn distance_field(&mut self, occ_threshold_fp: i16) -> &[f32] {
+        let needs_recompute = self.field_dirty
+            || self.field.is_none()
+            || self.field_threshold_fp != occ_threshold_fp;
+        if needs_recompute {
+            self.recompute_distance_field(occ_threshold_fp);
+        }
+        // Safe: recompute_distance_field always populates `self.field`.
+        self.field.as_ref().expect("field populated").as_slice()
+    }
+
+    fn recompute_distance_field(&mut self, occ_threshold_fp: i16) {
+        let n = self.w * self.h;
+        // Initialize: 0 at obstacle, +∞ elsewhere (squared-distance space).
+        let mut buf = vec![f32::INFINITY; n];
+        let mut any_occ = false;
+        for idx in 0..n {
+            if self.log[idx] > occ_threshold_fp {
+                buf[idx] = 0.0;
+                any_occ = true;
+            }
+        }
+        let cell = self.cfg.cell;
+        if !any_occ {
+            // No obstacles yet — saturate to grid-diagonal-ish distance
+            // so likelihoods at any pose are uniformly small.
+            let cap = self.w as f32 * cell;
+            self.field = Some(vec![cap; n]);
+            self.field_threshold_fp = occ_threshold_fp;
+            self.field_dirty = false;
+            return;
+        }
+        let w = self.w; let h = self.h;
+        let cap = w.max(h);
+        let mut tmp = vec![0.0_f32; cap];
+        let mut line_in = vec![0.0_f32; cap];
+        // Pass 1 — DT over each row (along x).
+        for r in 0..h {
+            for c in 0..w { line_in[c] = buf[r * w + c]; }
+            dt_1d(&line_in[..w], &mut tmp[..w]);
+            for c in 0..w { buf[r * w + c] = tmp[c]; }
+        }
+        // Pass 2 — DT over each column (along y).
+        for c in 0..w {
+            for r in 0..h { line_in[r] = buf[r * w + c]; }
+            dt_1d(&line_in[..h], &mut tmp[..h]);
+            for r in 0..h { buf[r * w + c] = tmp[r]; }
+        }
+        // buf now holds squared cell-distance; convert to metres.
+        for v in buf.iter_mut() { *v = v.sqrt() * cell; }
+        self.field = Some(buf);
+        self.field_threshold_fp = occ_threshold_fp;
+        self.field_dirty = false;
     }
 
     // ── Persistence ────────────────────────────────────────────────────
@@ -236,8 +316,81 @@ impl OccupancyGrid {
                 *v = i16::from_le_bytes(v.to_ne_bytes());
             }
         }
-        Ok(Some(Self { cfg, w, h, log }))
+        Ok(Some(Self {
+            cfg, w, h, log,
+            field: None,
+            field_threshold_fp: 0,
+            field_dirty: true,
+        }))
     }
+}
+
+// ── 1D Euclidean distance transform (Felzenszwalb & Huttenlocher 2004) ──
+
+/// Lower-envelope sweep over the parabolas `y_q(x) = (x - q)^2 + f[q]`.
+/// `f` carries 0 at "target" cells and +∞ elsewhere; result is the
+/// squared distance to the nearest target along the 1D axis.
+///
+/// Skips non-finite samples explicitly — naive Felzenszwalb computes
+/// `f[q] - f[v[k]]` which is NaN when both are +∞ and silently breaks
+/// the envelope. Real implementations handle the indicator-function
+/// case by treating +∞ samples as "no parabola here".
+fn dt_1d(f: &[f32], d: &mut [f32]) {
+    let n = f.len();
+    debug_assert!(d.len() >= n);
+    if n == 0 { return; }
+
+    // Lower-envelope state: parallel arrays of parabola indices `v` and
+    // their boundary x-values `z`. `z` is always one longer than `v` —
+    // entries z[0..v.len()] are left boundaries, z[v.len()] is +∞.
+    let mut v: Vec<usize> = Vec::with_capacity(n);
+    let mut z: Vec<f32>   = Vec::with_capacity(n + 1);
+
+    for q in 0..n {
+        if !f[q].is_finite() { continue; }
+        // While this parabola dominates the current top-of-envelope from
+        // before its left boundary, pop the latter.
+        loop {
+            match v.last() {
+                Some(&last_q) => {
+                    let s = compute_intersection(f, q, last_q);
+                    let last_z = *z.last().expect("z aligned with v");
+                    if s <= last_z {
+                        v.pop();
+                        z.pop();
+                    } else {
+                        z.push(s);
+                        break;
+                    }
+                }
+                None => {
+                    z.push(f32::NEG_INFINITY);
+                    break;
+                }
+            }
+        }
+        v.push(q);
+    }
+    z.push(f32::INFINITY);
+
+    if v.is_empty() {
+        // No finite samples on this line — distances stay +∞.
+        for slot in d.iter_mut().take(n) { *slot = f32::INFINITY; }
+        return;
+    }
+    let mut k = 0_usize;
+    for q in 0..n {
+        while z[k + 1] < q as f32 { k += 1; }
+        let dq = (q as f32) - (v[k] as f32);
+        d[q] = dq * dq + f[v[k]];
+    }
+}
+
+#[inline]
+fn compute_intersection(f: &[f32], q: usize, vk: usize) -> f32 {
+    let qf  = q  as f32;
+    let vkf = vk as f32;
+    ((f[q] + qf * qf) - (f[vk] + vkf * vkf)) / (2.0 * qf - 2.0 * vkf)
 }
 
 // ── Bresenham ─────────────────────────────────────────────────────────────
@@ -266,6 +419,60 @@ pub fn bresenham<F: FnMut(i32, i32, bool)>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distance_field_matches_hand_computed() {
+        // 5×5 grid, single obstacle at (2, 2). Distances should be the
+        // Euclidean distance from each cell to that obstacle, in metres.
+        let mut g = OccupancyGrid::new(GridConfig {
+            x_range: (0.0, 0.5),
+            y_range: (0.0, 0.5),
+            cell:    0.10,
+        });
+        // Hammer (2, 2) until log-odds saturate above any threshold.
+        for _ in 0..20 {
+            // Cast a ray that ends exactly at cell (2, 2) — j=2 → x=0.25,
+            // i=2 → y=0.25, with both contype/floor checks bypassed via
+            // the integrate_ray hit_is_occupied=true path.
+            g.integrate_ray(0.0, 0.0, 0.25, 0.25, true);
+        }
+        let field = g.distance_field(150 /* = 1.5 in fixed-point */).to_vec();
+        let cell = g.cell();
+        // Spot-check a few cells.
+        for &(i, j, expected_cells) in &[
+            (2_usize, 2_usize, 0.0_f32),
+            (2,       3,       1.0),
+            (2,       0,       2.0),
+            (0,       0,       (2.0_f32 * 2.0 + 2.0 * 2.0).sqrt()),
+            (4,       4,       (2.0_f32 * 2.0 + 2.0 * 2.0).sqrt()),
+        ] {
+            let got = field[i * g.width() + j];
+            let want = expected_cells * cell;
+            assert!((got - want).abs() < 1e-4,
+                "cell ({i},{j}): expected {want:.3} m, got {got:.3} m");
+        }
+        // Cache hit: second call must be a no-op (no panic, same values).
+        let field2 = g.distance_field(150);
+        assert_eq!(field2.len(), 25);
+    }
+
+    #[test]
+    fn distance_field_invalidates_on_mutation() {
+        let mut g = OccupancyGrid::new(GridConfig {
+            x_range: (0.0, 0.5), y_range: (0.0, 0.5), cell: 0.10,
+        });
+        for _ in 0..20 {
+            g.integrate_ray(0.0, 0.0, 0.25, 0.25, true);
+        }
+        let d_before = g.distance_field(150)[0];   // distance from (0,0)
+        // Add a much closer obstacle and confirm the cache rebuilt.
+        for _ in 0..20 {
+            g.integrate_ray(0.4, 0.4, 0.05, 0.05, true);
+        }
+        let d_after = g.distance_field(150)[0];
+        assert!(d_after < d_before,
+            "cache must invalidate after integrate_ray: before={d_before}, after={d_after}");
+    }
 
     #[test]
     fn world_to_idx_round_trip() {
