@@ -68,6 +68,18 @@ pub struct MclConfig {
     pub max_inject_frac: f32,
     /// Reserved (kept for parity with Python's call sites).
     pub inject_std_m: f32,
+    /// Gaussian per-particle pose prior added to scan log-likelihoods
+    /// in `update_accumulated`. Each particle receives an extra
+    /// log-weight of `-||(p - ref)||² / 2σ² - dyaw² / 2σ²_yaw` where
+    /// `ref` is the `current_est_pose` argument to `update_accumulated`
+    /// (typically the localizer's pre-update best, which represents
+    /// the predict-step belief). This pulls particles toward poses
+    /// consistent with the previous tracked belief — without it the
+    /// filter can re-lock onto a wrong-but-also-map-consistent cluster
+    /// (e.g. yaw-symmetric room), causing the best estimate to teleport.
+    /// Set both to 0.0 to disable (matches the Python sim's behaviour).
+    pub pose_prior_sigma_xy:  f32,
+    pub pose_prior_sigma_yaw: f32,
 }
 
 impl Default for MclConfig {
@@ -88,6 +100,12 @@ impl Default for MclConfig {
             alpha_fast: 0.30,
             max_inject_frac: 0.50,
             inject_std_m:    0.30,
+            // Disabled by default — matches the Python sim's behaviour
+            // and the original "trust scans only" weighting. Real-robot
+            // runners should set both > 0 to bias particles toward the
+            // last-tracked belief.
+            pose_prior_sigma_xy:  0.0,
+            pose_prior_sigma_yaw: 0.0,
         }
     }
 }
@@ -423,6 +441,23 @@ impl Localizer {
             scored.push((beam, pred));
         }
         if scored.is_empty() { return; }
+
+        // Pose prior: bias each particle's log-weight toward
+        // `current_est_pose` (the predict-step belief). Without this,
+        // the filter is purely scan-driven and can re-lock onto a
+        // wrong-but-also-map-consistent cluster — common in
+        // yaw-symmetric rooms — causing `best()` to teleport. Disabled
+        // when both sigmas are zero to preserve sim behaviour.
+        if cfg.pose_prior_sigma_xy > 0.0 && cfg.pose_prior_sigma_yaw > 0.0 {
+            let two_sx2  = 2.0 * cfg.pose_prior_sigma_xy  * cfg.pose_prior_sigma_xy;
+            let two_sy2  = 2.0 * cfg.pose_prior_sigma_yaw * cfg.pose_prior_sigma_yaw;
+            for (i, p) in self.particles.iter().enumerate() {
+                let dx = p.x - cur_x;
+                let dy = p.y - cur_y;
+                let dyaw = wrap_pi(p.yaw - cur_yaw);
+                log_w[i] -= (dx * dx + dy * dy) / two_sx2 + dyaw * dyaw / two_sy2;
+            }
+        }
 
         let log_w_max = log_w.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         for (w, lw) in self.weights.iter_mut().zip(&log_w) {
