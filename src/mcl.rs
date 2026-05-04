@@ -80,6 +80,16 @@ pub struct MclConfig {
     /// Set both to 0.0 to disable (matches the Python sim's behaviour).
     pub pose_prior_sigma_xy:  f32,
     pub pose_prior_sigma_yaw: f32,
+    /// Enable random-particle injection inside `update`/`update_accumulated`
+    /// when the recent fit looks bad (augmented MCL & wide-residual paths).
+    /// On a complete map this is correct kidnap-recovery behaviour. While
+    /// the map is still being built, residuals are naturally high in
+    /// unexplored areas — injection scatters particles across the whole
+    /// map and, even with a tight pose prior, occasionally a sample lands
+    /// near a wrong-but-also-consistent cluster and the filter snaps to
+    /// it. Disable while building a fresh map; re-enable when localising
+    /// against a saved one.
+    pub enable_kidnap_injection: bool,
 }
 
 impl Default for MclConfig {
@@ -106,6 +116,8 @@ impl Default for MclConfig {
             // last-tracked belief.
             pose_prior_sigma_xy:  0.0,
             pose_prior_sigma_yaw: 0.0,
+            // Default ON to preserve historical sim behaviour.
+            enable_kidnap_injection: true,
         }
     }
 }
@@ -374,14 +386,16 @@ impl Localizer {
         // the recent fit dips (kidnap, walking off the mapped region,
         // etc.), w_fast drops faster than w_slow → some particles get
         // replaced with random samples. Once w_slow catches up, tapers.
-        let p_inject = if self.w_slow > 0.0 {
-            (1.0 - self.w_fast / self.w_slow).max(0.0)
-        } else { 0.0 };
-        let n_inject = (p_inject * n as f32) as usize;
-        let cap = (cfg.max_inject_frac * n as f32) as usize;
-        let n_inject = n_inject.min(cap);
-        if n_inject > 0 {
-            self.inject_random(grid, n_inject);
+        if cfg.enable_kidnap_injection {
+            let p_inject = if self.w_slow > 0.0 {
+                (1.0 - self.w_fast / self.w_slow).max(0.0)
+            } else { 0.0 };
+            let n_inject = (p_inject * n as f32) as usize;
+            let cap = (cfg.max_inject_frac * n as f32) as usize;
+            let n_inject = n_inject.min(cap);
+            if n_inject > 0 {
+                self.inject_random(grid, n_inject);
+            }
         }
     }
 
@@ -492,9 +506,16 @@ impl Localizer {
             self.systematic_resample();
         }
 
-        // Wide-scan flush failed to find a good fit → re-disperse.
+        // Wide-scan flush failed to find a good fit → re-disperse half
+        // the cloud into random samples for kidnap recovery. Only fires
+        // when injection is enabled — during fresh mapping this would
+        // scatter particles across the partial map and hand any wrong-
+        // but-also-consistent cluster a foothold.
         const WIDE_RESID_BAD_M: f32 = 0.50;
-        if self.last_residual_m.is_finite() && self.last_residual_m > WIDE_RESID_BAD_M {
+        if cfg.enable_kidnap_injection
+            && self.last_residual_m.is_finite()
+            && self.last_residual_m > WIDE_RESID_BAD_M
+        {
             self.inject_random(grid, n / 2);
         }
     }
