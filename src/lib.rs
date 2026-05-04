@@ -17,6 +17,7 @@ pub mod follower;
 pub mod grid;
 pub mod mcl;
 pub mod planner;
+pub mod scan_matcher;
 pub mod stream;
 pub mod wire;
 
@@ -25,4 +26,5 @@ pub use follower::{follow_step, FollowCommand, FollowerState};
 pub use grid::{GridConfig, OccupancyGrid};
 pub use mcl::{FieldRelocConfig, Localizer, MclConfig, Particle};
 pub use planner::{plan, PlannerConfig};
+pub use scan_matcher::{match_scan, ScanMatchConfig, ScanMatchResult};
 pub use wire::{Goal, LockState, Message, Path as WirePath, Pose, Scan};
