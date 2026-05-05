@@ -67,8 +67,10 @@ impl Default for MclConfig {
             resample_ess_frac: 0.5,
             locked_xy_std_m: 0.15,
             locked_yaw_std_rad: 8.0_f32.to_radians(),
-            locked_max_residual_m: 0.10,
-            locked_min_frames: 5,
+            locked_max_residual_m: 0.12,
+            // 25 frames at 15 Hz ≈ 1.7 s of consistent narrow cloud.
+            // Faster than this and a one-frame fluke can declare lock.
+            locked_min_frames: 25,
             jitter_xy_m: 0.005,
             jitter_yaw_rad: 0.005,
         }
@@ -159,6 +161,40 @@ impl Localizer {
         self.last_residual_m = f32::NAN;
     }
 
+    /// Mixed seed: a fraction of particles around `seeds` (Gaussian
+    /// noise) and the rest uniformly over the grid's free cells. Use
+    /// this to combine a brute-force candidate with exploration — if
+    /// the brute-force pose is wrong, the uniform cloud still has a
+    /// chance to win after a few frames of motion.
+    pub fn seed_mixed(
+        &mut self,
+        seeds: &[Pose2],
+        seeds_frac: f32,
+        grid: &OccupancyGrid,
+        spread_xy_m: f32,
+        spread_yaw_rad: f32,
+    ) {
+        // Start uniform, then overwrite the front `frac * N` particles
+        // with seeded ones.
+        self.seed_uniform(grid);
+        if seeds.is_empty() { return; }
+        let frac = seeds_frac.clamp(0.0, 1.0);
+        let n_seed = ((self.particles.len() as f32) * frac) as usize;
+        if n_seed == 0 { return; }
+        let nx = Normal::new(0.0_f32, spread_xy_m).unwrap();
+        let ny = Normal::new(0.0_f32, spread_xy_m).unwrap();
+        let nt = Normal::new(0.0_f32, spread_yaw_rad).unwrap();
+        for i in 0..n_seed {
+            let s = seeds[i % seeds.len()];
+            self.particles[i] = (
+                s.0 + nx.sample(&mut self.rng),
+                s.1 + ny.sample(&mut self.rng),
+                wrap_pi(s.2 + nt.sample(&mut self.rng)),
+            );
+        }
+        // reset_weights / streak / residual already zeroed by seed_uniform.
+    }
+
     /// Apply a body-frame motion delta with noise.
     pub fn predict(&mut self, dx_b: f32, dy_b: f32, dyaw: f32) {
         let trans = (dx_b * dx_b + dy_b * dy_b).sqrt();
@@ -219,11 +255,15 @@ impl Localizer {
                 sum += -(d * d) / two_sigma2;
                 n += 1;
             }
-            // If a particle drops below min_beams_used the prior pass already
-            // returned, but a single particle outside the map might score 0
-            // beams. Penalize with a very low log-weight.
+            // Use the *mean* per-beam log-likelihood, not the sum: with
+            // ~64 beams the sum makes the cloud collapse onto a single
+            // peak after one update (small per-beam differences become
+            // astronomical weight ratios) — exploration dies before
+            // motion gets a chance to disambiguate. Mean keeps the
+            // posterior soft enough that competing peaks survive a
+            // frame or two.
             if n == 0 { log_w.push(-1e6); }
-            else      { log_w.push(sum); }
+            else      { log_w.push(sum / (n as f32)); }
         }
         // Stabilize: subtract the max before exponentiating.
         let max_lw = log_w.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
