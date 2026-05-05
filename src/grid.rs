@@ -122,6 +122,19 @@ impl OccupancyGrid {
         self.log[idx] = v.clamp(LO_MIN as i32, LO_MAX as i32) as i16;
     }
 
+    /// Add a log-odds delta at the cell containing `(x, y)`. Used by
+    /// `global_render` to merge submap grids into a composite map: each
+    /// submap's per-cell log-odds is added to the global cell at the
+    /// world coordinate that cell maps to via the submap's anchor pose.
+    /// Out-of-bounds writes are silently ignored. Sum is clamped to
+    /// `[LO_MIN, LO_MAX]`.
+    pub fn add_log_odds_at_world(&mut self, x: f32, y: f32, delta: i16) {
+        if let Some((i, j)) = self.world_to_idx(x, y) {
+            self.field_dirty = true;
+            self.bump(i, j, delta);
+        }
+    }
+
     /// Integrate one ray from `(x0,y0)` (sensor origin) to `(x1,y1)` (hit).
     /// Cells along the ray are marked free; the endpoint is marked occupied
     /// iff `hit_is_occupied` (e.g. ray hit a wall, not the floor).
