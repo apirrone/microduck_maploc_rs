@@ -38,15 +38,20 @@ pub struct RelocalizeConfig {
 
 impl Default for RelocalizeConfig {
     fn default() -> Self {
+        // Tight defaults — we'd rather reject and search more frames
+        // than declare a wrong pose locked. The two-stage search
+        // doesn't cost a lot at 5 cm resolution, and a real ToF scan
+        // captured from the *correct* pose against a clean global
+        // render gives mean per-beam residuals well under 5 cm.
         Self {
             coarse_xy_stride:    2,
             coarse_yaw_bins:     36,
             refine_xy_radius:    4,
             refine_yaw_bins:     11,
             refine_yaw_half_rad: 10.0_f32.to_radians(),
-            max_mean_residual_m: 0.20,
-            min_beams_used:      16,
-            clamp_m:             0.50,
+            max_mean_residual_m: 0.05,
+            min_beams_used:      24,
+            clamp_m:             0.15,
         }
     }
 }

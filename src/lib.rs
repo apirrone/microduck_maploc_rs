@@ -21,6 +21,7 @@ pub mod follower;
 pub mod global_render;
 pub mod grid;
 pub mod loop_closer;
+pub mod mcl;
 pub mod mount;
 pub mod optimizer;
 pub mod planner;
