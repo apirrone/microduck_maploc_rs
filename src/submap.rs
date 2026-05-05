@@ -12,8 +12,18 @@
 
 use crate::grid::{GridConfig, OccupancyGrid};
 
-/// Pose in SE(2): `(x, y, yaw)`. World frame.
+/// Pose in SE(2): `(x, y, yaw)`.
 pub type Pose2 = (f32, f32, f32);
+
+/// One scan retained for loop-closure scan matching. Stored in the
+/// submap's *local* frame (so it's independent of any later anchor
+/// changes during pose-graph optimization).
+#[derive(Debug, Clone)]
+pub struct RawScan {
+    pub pose_in_submap: Pose2,
+    pub angles_body:  Vec<f32>,
+    pub ranges_horiz: Vec<f32>,
+}
 
 #[inline]
 fn wrap_pi(a: f32) -> f32 {
@@ -41,21 +51,39 @@ fn world_to_local(anchor: Pose2, body_world: Pose2) -> Pose2 {
     (xl, yl, yawl)
 }
 
+/// Number of raw scans retained per submap for loop-closure matching.
+/// 10 covers a few seconds of capture at 15 Hz; way more than enough
+/// to give the matcher signal but cheap (10 × 64 beams × 8 B = 5 KB).
+pub const MAX_RAW_SCANS: usize = 10;
+
 pub struct Submap {
     grid: OccupancyGrid,
     anchor_pose: Pose2,
+    raw_scans: Vec<RawScan>,
 }
 
 impl Submap {
     /// Create a submap with its origin (local 0,0,0) at `anchor_pose` in
     /// the world frame. The grid is sized by `grid_cfg`.
     pub fn new_at(anchor_pose: Pose2, grid_cfg: GridConfig) -> Self {
-        Self { grid: OccupancyGrid::new(grid_cfg), anchor_pose }
+        Self {
+            grid: OccupancyGrid::new(grid_cfg),
+            anchor_pose,
+            raw_scans: Vec::with_capacity(MAX_RAW_SCANS),
+        }
     }
 
     pub fn anchor_pose(&self) -> Pose2 { self.anchor_pose }
     pub fn grid(&self) -> &OccupancyGrid { &self.grid }
     pub fn grid_mut(&mut self) -> &mut OccupancyGrid { &mut self.grid }
+    pub fn raw_scans(&self) -> &[RawScan] { &self.raw_scans }
+
+    /// Update the anchor pose. Used by the pose-graph optimizer after
+    /// loop closure: the submap's local content (grid + raw scans)
+    /// stays untouched, only its anchor changes.
+    pub fn set_anchor_pose(&mut self, new_anchor: Pose2) {
+        self.anchor_pose = new_anchor;
+    }
 
     /// Integrate one scan. `body_pose_world` is the duck's pose at scan
     /// capture (world frame). `angles_body` and `ranges_horiz` are the
@@ -68,13 +96,22 @@ impl Submap {
         ranges_horiz: &[f32],
     ) {
         debug_assert_eq!(angles_body.len(), ranges_horiz.len());
-        let (ox, oy, oyaw) = world_to_local(self.anchor_pose, body_pose_world);
+        let pose_local = world_to_local(self.anchor_pose, body_pose_world);
+        let (ox, oy, oyaw) = pose_local;
         for (a, &r) in angles_body.iter().zip(ranges_horiz) {
             if !r.is_finite() || r <= 0.0 { continue; }
             let theta = oyaw + a;
             let hx = ox + r * theta.cos();
             let hy = oy + r * theta.sin();
             self.grid.integrate_ray(ox, oy, hx, hy, true);
+        }
+        // Retain the first `MAX_RAW_SCANS` for loop closure.
+        if self.raw_scans.len() < MAX_RAW_SCANS {
+            self.raw_scans.push(RawScan {
+                pose_in_submap: pose_local,
+                angles_body:  angles_body.to_vec(),
+                ranges_horiz: ranges_horiz.to_vec(),
+            });
         }
     }
 }

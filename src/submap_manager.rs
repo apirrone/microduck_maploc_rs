@@ -62,6 +62,7 @@ impl SubmapManager {
     }
 
     pub fn frozen(&self) -> &[Submap] { &self.frozen }
+    pub fn frozen_mut(&mut self) -> &mut [Submap] { &mut self.frozen }
     pub fn current(&self) -> Option<&Submap> { self.current.as_ref() }
     pub fn current_mut(&mut self) -> Option<&mut Submap> { self.current.as_mut() }
 
