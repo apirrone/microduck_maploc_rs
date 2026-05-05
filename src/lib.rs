@@ -25,6 +25,7 @@ pub mod mount;
 pub mod optimizer;
 pub mod planner;
 pub mod pose_graph;
+pub mod relocalize;
 pub mod replay;
 pub mod scan_matcher;
 pub mod session;
