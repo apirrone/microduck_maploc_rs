@@ -1,0 +1,15 @@
+# Python tooling for microduck_maploc_rs.
+#
+# Pure-Rust crates don't need this; it's here so `uv run tools/<X>.py`
+# auto-creates a venv with the right dependencies for the helper
+# scripts (calibration, session recording / replay, live viewer).
+
+[project]
+name = "microduck-maploc-tools"
+version = "0.1.0"
+description = "Python helpers for microduck_maploc_rs"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "matplotlib>=3.7",
+]
