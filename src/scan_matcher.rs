@@ -112,7 +112,9 @@ pub fn match_scan(
             || (i0 + 1) as usize >= h
             || (j0 + 1) as usize >= w
         {
-            return (cfg.sigma_m, 0.0, 0.0);
+            // Out of grid bounds: return distance > sigma_m so the caller
+            // skips this beam outright.
+            return (f32::INFINITY, 0.0, 0.0);
         }
         let i0u = i0 as usize;
         let j0u = j0 as usize;
@@ -152,9 +154,17 @@ pub fn match_scan(
             let ex = x + r * cos_t;
             let ey = y + r * sin_t;
             let (d, dd_dx, dd_dy) = sample(ex, ey);
-            // Saturate so one out-of-map beam doesn't dominate.
-            let d_sat = d.min(cfg.sigma_m);
-            residual_sum_sq += d_sat * d_sat;
+            // Skip beams whose endpoint is too far from any wall to be
+            // informative. Previously we saturated the residual with
+            // `d.min(sigma_m)` while still using the full Jacobian —
+            // that's the bug from v1: far-from-wall beams kept tugging
+            // the pose toward an irrelevant nearest wall. Outright
+            // skipping is the proper Huber-rejection equivalent for our
+            // distance-field cost.
+            if !d.is_finite() || d > cfg.sigma_m {
+                continue;
+            }
+            residual_sum_sq += d * d;
             n_used += 1;
             // Jacobian of d w.r.t. (x, y, yaw):
             //   ∂d/∂x   = ∂d/∂ex · ∂ex/∂x   = ∂d/∂ex
@@ -163,13 +173,12 @@ pub fn match_scan(
             let j0 = dd_dx;
             let j1 = dd_dy;
             let j2 = dd_dx * (-r * sin_t) + dd_dy * (r * cos_t);
-            // Symmetric outer-product accumulation.
             let js = [j0, j1, j2];
             for a in 0..3 {
                 for b in 0..3 {
                     hm[a][b] += js[a] * js[b];
                 }
-                gv[a] += js[a] * d_sat;
+                gv[a] += js[a] * d;
             }
         }
         if n_used == 0 { break; }
