@@ -51,6 +51,16 @@ impl SubmapManager {
         Self { cfg, frozen: Vec::new(), current: None, current_started_s: None }
     }
 
+    /// Restore a manager from a previously-saved state. `current_started_s`
+    /// is `None` so the next tick won't immediately switch on age.
+    pub fn from_parts(
+        cfg: SubmapManagerConfig,
+        frozen: Vec<Submap>,
+        current: Option<Submap>,
+    ) -> Self {
+        Self { cfg, frozen, current, current_started_s: None }
+    }
+
     pub fn config(&self) -> SubmapManagerConfig { self.cfg }
 
     /// Number of *frozen* submaps (excluding the active one).

@@ -6,7 +6,7 @@
 
 use crate::submap::Pose2;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct PoseNode {
     pub pose: Pose2,
     /// Index of the submap this node corresponds to in the submap list.
@@ -16,7 +16,7 @@ pub struct PoseNode {
     pub fixed: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct PoseEdge {
     pub from: usize,
     pub to: usize,
@@ -26,7 +26,7 @@ pub struct PoseEdge {
     pub information: [[f32; 3]; 3],
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct PoseGraph {
     nodes: Vec<PoseNode>,
     edges: Vec<PoseEdge>,

@@ -28,7 +28,7 @@ const SAVE_MAGIC: &[u8; 4] = b"MDLM";
 const SAVE_VERSION: u32 = 1;
 
 /// Geometry of an occupancy grid in world coordinates.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct GridConfig {
     pub x_range: (f32, f32),
     pub y_range: (f32, f32),
@@ -49,6 +49,7 @@ impl Default for GridConfig {
 
 /// 2D log-odds occupancy grid. Row-major, `[i, j]` indexed by
 /// `(row=y_index, col=x_index)`.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct OccupancyGrid {
     cfg: GridConfig,
     w: usize,
@@ -58,10 +59,15 @@ pub struct OccupancyGrid {
     /// Re-computed by `distance_field()` after a map mutation flips the
     /// dirty flag. Mirrors the Python sim's caching so the per-update
     /// cost is amortized.
+    #[serde(skip, default)]
     field: Option<Vec<f32>>,
+    #[serde(skip, default)]
     field_threshold_fp: i16,
+    #[serde(skip, default = "default_dirty")]
     field_dirty: bool,
 }
+
+fn default_dirty() -> bool { true }
 
 impl OccupancyGrid {
     pub fn new(cfg: GridConfig) -> Self {

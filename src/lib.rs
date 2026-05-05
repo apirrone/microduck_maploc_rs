@@ -27,6 +27,7 @@ pub mod planner;
 pub mod pose_graph;
 pub mod replay;
 pub mod scan_matcher;
+pub mod session;
 pub mod stream;
 pub mod submap;
 pub mod submap_manager;

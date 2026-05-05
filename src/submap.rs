@@ -18,7 +18,7 @@ pub type Pose2 = (f32, f32, f32);
 /// One scan retained for loop-closure scan matching. Stored in the
 /// submap's *local* frame (so it's independent of any later anchor
 /// changes during pose-graph optimization).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RawScan {
     pub pose_in_submap: Pose2,
     pub angles_body:  Vec<f32>,
@@ -56,6 +56,7 @@ fn world_to_local(anchor: Pose2, body_world: Pose2) -> Pose2 {
 /// to give the matcher signal but cheap (10 × 64 beams × 8 B = 5 KB).
 pub const MAX_RAW_SCANS: usize = 10;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Submap {
     grid: OccupancyGrid,
     anchor_pose: Pose2,
