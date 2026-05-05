@@ -51,6 +51,11 @@ pub struct MclConfig {
     /// cloud not collapse onto a single point too fast on quiet odom.
     pub jitter_xy_m: f32,
     pub jitter_yaw_rad: f32,
+    /// Fraction of particles replaced with fresh uniform samples after
+    /// each resample. Probes for missed posterior peaks; without this,
+    /// a wrong-but-plausible cluster can capture the cloud and never
+    /// release it.
+    pub random_inject_frac: f32,
 }
 
 impl Default for MclConfig {
@@ -61,8 +66,9 @@ impl Default for MclConfig {
             sigma_xy_per_rad: 0.05,
             sigma_yaw_per_m: 0.05,
             sigma_yaw_per_rad: 0.10,
-            beam_sigma_m: 0.15,
+            beam_sigma_m: 0.20,
             beam_clamp_m: 0.50,
+            random_inject_frac: 0.05,
             min_beams_used: 16,
             resample_ess_frac: 0.5,
             locked_xy_std_m: 0.15,
@@ -255,15 +261,11 @@ impl Localizer {
                 sum += -(d * d) / two_sigma2;
                 n += 1;
             }
-            // Use the *mean* per-beam log-likelihood, not the sum: with
-            // ~64 beams the sum makes the cloud collapse onto a single
-            // peak after one update (small per-beam differences become
-            // astronomical weight ratios) — exploration dies before
-            // motion gets a chance to disambiguate. Mean keeps the
-            // posterior soft enough that competing peaks survive a
-            // frame or two.
+            // Sum (not mean) so weight contrast is high enough that
+            // ESS-based resampling fires when the cloud needs to
+            // collapse. Softness comes from `beam_sigma_m`.
             if n == 0 { log_w.push(-1e6); }
-            else      { log_w.push(sum / (n as f32)); }
+            else      { log_w.push(sum); }
         }
         // Stabilize: subtract the max before exponentiating.
         let max_lw = log_w.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -305,6 +307,16 @@ impl Localizer {
         let ess: f32 = 1.0 / self.weights.iter().map(|w| w * w).sum::<f32>().max(1e-12);
         if ess < self.cfg.resample_ess_frac * (self.particles.len() as f32) {
             self.systematic_resample();
+            // Replace `random_inject_frac` of the (now duplicated)
+            // resampled particles with fresh uniform samples drawn from
+            // the grid's free cells. Keeps exploration alive without
+            // melting the rest of the posterior.
+            let n_inject = ((self.particles.len() as f32)
+                            * self.cfg.random_inject_frac.clamp(0.0, 1.0))
+                           as usize;
+            if n_inject > 0 {
+                self.inject_uniform(grid, n_inject);
+            }
         }
 
         // Update lock streak based on cloud spread + best-particle residual.
@@ -377,6 +389,31 @@ impl Localizer {
     fn reset_weights(&mut self) {
         let n = self.particles.len() as f32;
         for w in self.weights.iter_mut() { *w = 1.0 / n; }
+    }
+
+    /// Replace the front `count` particles with fresh uniform samples
+    /// over the grid's free cells. Weights left untouched (they get
+    /// reset on the next resample anyway).
+    fn inject_uniform(&mut self, grid: &OccupancyGrid, count: usize) {
+        let cfg = grid.cfg();
+        let cell = cfg.cell;
+        let w = grid.width(); let h = grid.height();
+        // Sample free cells one at a time; if we hit too many occupied
+        // cells in a row just give up and leave the particle alone.
+        let mut placed = 0usize;
+        let mut tries = 0usize;
+        let two_pi = 2.0 * std::f32::consts::PI;
+        while placed < count && tries < count * 20 {
+            tries += 1;
+            let i = self.rng.gen_range(0..h);
+            let j = self.rng.gen_range(0..w);
+            if !grid.is_known_free(i, j) { continue; }
+            let cx = cfg.x_range.0 + (j as f32 + 0.5) * cell;
+            let cy = cfg.y_range.0 + (i as f32 + 0.5) * cell;
+            let yaw = self.rng.gen::<f32>() * two_pi - std::f32::consts::PI;
+            self.particles[placed] = (cx, cy, yaw);
+            placed += 1;
+        }
     }
 
     fn systematic_resample(&mut self) {
