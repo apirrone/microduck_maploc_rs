@@ -78,6 +78,11 @@ pub struct MclConfig {
     /// Alternative path to a streak increment: a yaw rotation of at
     /// least this much (radians) since the last increment.
     pub lock_min_rotation_per_streak_rad: f32,
+    /// Skip resampling for the first N updates. Lets weight evidence
+    /// accumulate multiplicatively across frames so the cloud doesn't
+    /// collapse on frame 1 to whichever wrong cluster fit best. After
+    /// the grace period, normal ESS-based resampling resumes.
+    pub min_updates_before_resample: u32,
 }
 
 impl Default for MclConfig {
@@ -102,16 +107,21 @@ impl Default for MclConfig {
             jitter_xy_m: 0.005,
             jitter_yaw_rad: 0.005,
             wall_threshold_fp: 200,
-            // Soften the posterior so the cloud doesn't collapse to a
-            // single peak after one update — with ~64 beams and σ=0.20m
-            // the raw posterior is brutally peaky.
-            likelihood_temper: 0.3,
-            // Lock requires demonstrated motion, not just a momentarily
-            // narrow cloud. 5 cm or ~3° per streak step → with
-            // `locked_min_frames: 25` total ≈ 1.25 m of travel or 75°
-            // of rotation before lock.
+            // Soften the posterior. With 64 beams and σ=0.20 m the
+            // raw posterior spans ~200 nats; temper=0.15 compresses
+            // that to ~30, so multiple competing modes survive instead
+            // of collapsing onto whichever cluster fit slightly best.
+            likelihood_temper: 0.15,
+            // Motion gating: see `relocalize_start_odom` plumbing in
+            // the runtime. These values are still consulted as a
+            // *lower bound* inside MCL but the runtime applies a
+            // stricter net-displacement check on top.
             lock_min_motion_per_streak_m: 0.05,
             lock_min_rotation_per_streak_rad: 0.05,
+            // Don't resample on frames 1..5 — let weights multiply
+            // across updates so the cloud commits only after multiple
+            // frames of consistent evidence.
+            min_updates_before_resample: 5,
         }
     }
 }
@@ -131,6 +141,9 @@ pub struct Localizer {
     motion_since_streak_m: f32,
     /// Same idea for rotation.
     rotation_since_streak_rad: f32,
+    /// Number of `update` calls so far. Used by the
+    /// `min_updates_before_resample` grace period.
+    update_count: u32,
 }
 
 impl Localizer {
@@ -145,6 +158,7 @@ impl Localizer {
             locked_streak: 0,
             motion_since_streak_m: 0.0,
             rotation_since_streak_rad: 0.0,
+            update_count: 0,
         }
     }
 
@@ -187,6 +201,7 @@ impl Localizer {
         self.last_residual_m = f32::NAN;
         self.motion_since_streak_m = 0.0;
         self.rotation_since_streak_rad = 0.0;
+        self.update_count = 0;
     }
 
     /// Seed particles from a small list of candidate poses (e.g. the
@@ -210,6 +225,7 @@ impl Localizer {
         self.last_residual_m = f32::NAN;
         self.motion_since_streak_m = 0.0;
         self.rotation_since_streak_rad = 0.0;
+        self.update_count = 0;
     }
 
     /// Mixed seed: a fraction of particles around `seeds` (Gaussian
@@ -324,17 +340,23 @@ impl Localizer {
         let temper = self.cfg.likelihood_temper.max(1e-6);
         // Stabilize: subtract the max before exponentiating.
         let max_lw = log_w.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        // Multiplicative weight update — keep prior evidence around so
+        // the cloud commits only after multiple frames agree. After
+        // resampling fires, weights are reset uniform anyway, so this
+        // collapses to the usual single-frame likelihood update from
+        // that point on.
         let mut sum_w = 0.0_f32;
         for (w_out, &lw) in self.weights.iter_mut().zip(log_w.iter()) {
-            let v = ((lw - max_lw) * temper).exp();
-            *w_out = v;
-            sum_w += v;
+            let factor = ((lw - max_lw) * temper).exp();
+            *w_out *= factor;
+            sum_w += *w_out;
         }
         if sum_w > 0.0 {
             for w_out in self.weights.iter_mut() { *w_out /= sum_w; }
         } else {
             self.reset_weights();
         }
+        self.update_count += 1;
 
         // Best particle residual for the lock check.
         if let Some((best_idx, _)) = self.weights.iter().enumerate()
@@ -358,9 +380,12 @@ impl Localizer {
             self.last_residual_m = if n > 0 { sum / (n as f32) } else { f32::NAN };
         }
 
-        // Resample if ESS too low.
+        // Resample if ESS too low — but only after the grace period.
+        // During grace, weights keep accumulating evidence across
+        // frames; resampling early throws that away.
         let ess: f32 = 1.0 / self.weights.iter().map(|w| w * w).sum::<f32>().max(1e-12);
-        if ess < self.cfg.resample_ess_frac * (self.particles.len() as f32) {
+        if self.update_count >= self.cfg.min_updates_before_resample
+            && ess < self.cfg.resample_ess_frac * (self.particles.len() as f32) {
             self.systematic_resample();
             // Replace `random_inject_frac` of the (now duplicated)
             // resampled particles with fresh uniform samples drawn from
@@ -650,7 +675,11 @@ mod tests {
         }
         mcl.reset_weights();
         let (a, r) = fake_scan(&mut grid, truth, 64);
-        mcl.update(&mut grid, &a, &r);
+        // Run several updates so the cloud commits past the
+        // `min_updates_before_resample` grace period.
+        for _ in 0..8 {
+            mcl.update(&mut grid, &a, &r);
+        }
 
         // After update + (internal) resample, weights are uniform — the
         // signal of "truth dominated" lives in particle *positions*, not
