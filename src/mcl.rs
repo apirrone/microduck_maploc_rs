@@ -106,7 +106,11 @@ impl Default for MclConfig {
             resample_ess_frac: 0.5,
             locked_xy_std_m: 0.15,
             locked_yaw_std_rad: 8.0_f32.to_radians(),
-            locked_max_residual_m: 0.12,
+            // Tight residual gate. With a clean v2-threshold map, the
+            // correct pose returns residuals < 3 cm; anything above
+            // 5 cm is a wrong-cluster fit using map noise as a
+            // crutch. Better to never lock than to lock wrong.
+            locked_max_residual_m: 0.05,
             // 25 frames at 15 Hz ≈ 1.7 s of consistent narrow cloud.
             // Faster than this and a one-frame fluke can declare lock.
             locked_min_frames: 25,
