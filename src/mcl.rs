@@ -62,6 +62,22 @@ pub struct MclConfig {
     /// transient noise — useful when the saved map is fuzzy. 200 ≈ "a
     /// cell needed 3+ net hits to be a wall".
     pub wall_threshold_fp: i16,
+    /// Tempering factor for the observation likelihood. log-likelihoods
+    /// are multiplied by this before normalising. 1.0 = raw (very peaky
+    /// with ~64 beams; the cloud collapses to a single cluster after
+    /// one frame, which is usually wrong with a 45° FOV); 0.0 = ignore
+    /// the scan entirely. Lower values keep competing modes alive long
+    /// enough that subsequent motion can disambiguate. 0.3 is a
+    /// reasonable default for ~64-beam VL53L5CX scans.
+    pub likelihood_temper: f32,
+    /// Minimum translation (metres) that must accumulate via `predict`
+    /// between successive streak increments. A stationary duck whose
+    /// cloud happens to be narrow won't lock — motion is required to
+    /// validate the hypothesis.
+    pub lock_min_motion_per_streak_m: f32,
+    /// Alternative path to a streak increment: a yaw rotation of at
+    /// least this much (radians) since the last increment.
+    pub lock_min_rotation_per_streak_rad: f32,
 }
 
 impl Default for MclConfig {
@@ -86,6 +102,16 @@ impl Default for MclConfig {
             jitter_xy_m: 0.005,
             jitter_yaw_rad: 0.005,
             wall_threshold_fp: 200,
+            // Soften the posterior so the cloud doesn't collapse to a
+            // single peak after one update — with ~64 beams and σ=0.20m
+            // the raw posterior is brutally peaky.
+            likelihood_temper: 0.3,
+            // Lock requires demonstrated motion, not just a momentarily
+            // narrow cloud. 5 cm or ~3° per streak step → with
+            // `locked_min_frames: 25` total ≈ 1.25 m of travel or 75°
+            // of rotation before lock.
+            lock_min_motion_per_streak_m: 0.05,
+            lock_min_rotation_per_streak_rad: 0.05,
         }
     }
 }
@@ -99,6 +125,12 @@ pub struct Localizer {
     last_residual_m: f32,
     /// Frames in a row that satisfied the lock criteria.
     locked_streak: u32,
+    /// Translation (metres) received via `predict` since the lock-streak
+    /// counter last advanced. Used to gate streak increments on real
+    /// motion, so a stationary duck can never accidentally lock.
+    motion_since_streak_m: f32,
+    /// Same idea for rotation.
+    rotation_since_streak_rad: f32,
 }
 
 impl Localizer {
@@ -111,6 +143,8 @@ impl Localizer {
             rng: StdRng::seed_from_u64(seed),
             last_residual_m: f32::NAN,
             locked_streak: 0,
+            motion_since_streak_m: 0.0,
+            rotation_since_streak_rad: 0.0,
         }
     }
 
@@ -151,6 +185,8 @@ impl Localizer {
         self.reset_weights();
         self.locked_streak = 0;
         self.last_residual_m = f32::NAN;
+        self.motion_since_streak_m = 0.0;
+        self.rotation_since_streak_rad = 0.0;
     }
 
     /// Seed particles from a small list of candidate poses (e.g. the
@@ -172,6 +208,8 @@ impl Localizer {
         self.reset_weights();
         self.locked_streak = 0;
         self.last_residual_m = f32::NAN;
+        self.motion_since_streak_m = 0.0;
+        self.rotation_since_streak_rad = 0.0;
     }
 
     /// Mixed seed: a fraction of particles around `seeds` (Gaussian
@@ -212,6 +250,9 @@ impl Localizer {
     pub fn predict(&mut self, dx_b: f32, dy_b: f32, dyaw: f32) {
         let trans = (dx_b * dx_b + dy_b * dy_b).sqrt();
         let rot   = dyaw.abs();
+        // Track real motion so lock gating can require it.
+        self.motion_since_streak_m += trans;
+        self.rotation_since_streak_rad += rot;
         let sigma_xy = self.cfg.sigma_xy_per_m * trans
                      + self.cfg.sigma_xy_per_rad * rot
                      + self.cfg.jitter_xy_m;
@@ -274,11 +315,18 @@ impl Localizer {
             if n == 0 { log_w.push(-1e6); }
             else      { log_w.push(sum); }
         }
+        // Temper the log-likelihoods before normalizing (raise the
+        // posterior to a power < 1). Keeps competing modes alive past
+        // the first update — with 64 beams and σ=0.20 m the raw
+        // posterior is peaky enough that one frame collapses the cloud
+        // to whichever cluster happened to fit best, regardless of
+        // whether it's right.
+        let temper = self.cfg.likelihood_temper.max(1e-6);
         // Stabilize: subtract the max before exponentiating.
         let max_lw = log_w.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut sum_w = 0.0_f32;
         for (w_out, &lw) in self.weights.iter_mut().zip(log_w.iter()) {
-            let v = (lw - max_lw).exp();
+            let v = ((lw - max_lw) * temper).exp();
             *w_out = v;
             sum_w += v;
         }
@@ -326,15 +374,34 @@ impl Localizer {
             }
         }
 
-        // Update lock streak based on cloud spread + best-particle residual.
+        // Update lock streak based on cloud spread + best-particle
+        // residual AND demonstrated motion since the last streak step.
+        // A stationary duck whose cloud collapsed on a wrong cluster
+        // would otherwise streak forever and lock — motion is the only
+        // signal that can disambiguate a 45° FOV.
         let xy_std = self.position_std();
         let yaw_std = self.yaw_std();
         let res_ok = self.last_residual_m.is_finite()
             && self.last_residual_m <= self.cfg.locked_max_residual_m;
         let spread_ok = xy_std <= self.cfg.locked_xy_std_m
                      && yaw_std <= self.cfg.locked_yaw_std_rad;
-        if res_ok && spread_ok { self.locked_streak += 1; }
-        else                   { self.locked_streak = 0; }
+        let motion_ok = self.motion_since_streak_m
+                          >= self.cfg.lock_min_motion_per_streak_m
+                     || self.rotation_since_streak_rad
+                          >= self.cfg.lock_min_rotation_per_streak_rad;
+        if res_ok && spread_ok && motion_ok {
+            self.locked_streak += 1;
+            self.motion_since_streak_m = 0.0;
+            self.rotation_since_streak_rad = 0.0;
+        } else if !res_ok || !spread_ok {
+            // Bad fit / wide cloud → reset streak. Keep motion
+            // accumulating so a stationary duck that suddenly walks
+            // doesn't have to wait for a fresh motion budget.
+            self.locked_streak = 0;
+        }
+        // res_ok && spread_ok but no motion yet → don't increment, but
+        // don't reset either. Cloud stays tentatively narrow until the
+        // duck moves enough to validate.
     }
 
     /// Highest-weight particle.
@@ -585,21 +652,18 @@ mod tests {
         let (a, r) = fake_scan(&mut grid, truth, 64);
         mcl.update(&mut grid, &a, &r);
 
-        // Sum the weights of the truth half vs the decoy half.
-        let w_truth: f32 = mcl.weights[..half].iter().sum();
-        let w_decoy: f32 = mcl.weights[half..].iter().sum();
-        // Expect the truth half to dominate after the post-resample
-        // step; allow some slack but require > 80%.
-        assert!(w_truth > 0.7 * (w_truth + w_decoy)
-                || mcl.particles[mcl.weights.iter().enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                    .map(|(i, _)| i).unwrap()].0
-                    .abs() < 1.0,  // at minimum the best particle is in the truth area
-                "weights didn't concentrate around truth: w_truth={w_truth:.2} \
-                 w_decoy={w_decoy:.2}");
-        let best = mcl.best();
-        let dist = ((best.0 - truth.0).powi(2)
-                  + (best.1 - truth.1).powi(2)).sqrt();
-        assert!(dist < 0.30, "best off truth by {dist:.2}");
+        // After update + (internal) resample, weights are uniform — the
+        // signal of "truth dominated" lives in particle *positions*, not
+        // weights. Count particles near the truth pose vs the decoy.
+        let near = |p: (f32, f32, f32), c: (f32, f32, f32), r: f32| {
+            let dx = p.0 - c.0; let dy = p.1 - c.1;
+            (dx * dx + dy * dy).sqrt() < r
+        };
+        let decoy = (-1.0_f32, 0.5_f32, std::f32::consts::PI);
+        let n_truth = mcl.particles.iter().filter(|p| near(**p, truth, 0.30)).count();
+        let n_decoy = mcl.particles.iter().filter(|p| near(**p, decoy, 0.30)).count();
+        assert!(n_truth > 3 * n_decoy.max(1),
+                "truth cluster didn't dominate: near_truth={n_truth} \
+                 near_decoy={n_decoy}");
     }
 }
