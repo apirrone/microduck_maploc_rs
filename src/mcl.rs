@@ -176,32 +176,37 @@ impl Localizer {
     pub fn n_particles(&self) -> usize { self.particles.len() }
     pub fn last_residual_m(&self) -> f32 { self.last_residual_m }
     pub fn locked_streak(&self) -> u32 { self.locked_streak }
-    /// Fraction of particles within `locked_xy_std_m` of the best
-    /// (highest-weight) particle. Anchoring on `best()` rather than
-    /// `weighted_mean()` is robust to bi-modal clouds — the mean of
-    /// two distinct modes falls in dead space between them, the best
-    /// particle is by definition inside the densest cluster.
+    /// Anchor for the dominant-cluster fraction checks: centre of the
+    /// densest (x, y, yaw) bin. Stable across frames even when
+    /// per-particle weights hop within a cluster.
+    fn cluster_anchor(&self) -> Pose2 {
+        // Use a bin slightly larger than the lock radii so we capture
+        // the cluster's bulk in one bin even when particles spill near
+        // a bin boundary.
+        let cell = self.cfg.locked_xy_std_m * 1.5;
+        let yaw = self.cfg.locked_yaw_std_rad * 1.5;
+        self.densest_bin_center(cell, yaw)
+    }
+
+    /// Fraction of particles within `locked_xy_std_m` of the densest
+    /// bin's centre — robust to multimodal clouds and to the "best"
+    /// particle hopping between similar-weight neighbours.
     pub fn dominant_cluster_frac(&self) -> f32 {
-        let b = self.best();
-        self.fraction_within(b.0, b.1, self.cfg.locked_xy_std_m)
+        let a = self.cluster_anchor();
+        self.fraction_within(a.0, a.1, self.cfg.locked_xy_std_m)
     }
 
-    /// Fraction of particles within `locked_yaw_std_rad` of the best
-    /// particle's yaw — the heading-axis analogue of
-    /// `dominant_cluster_frac`.
+    /// Heading-axis analogue.
     pub fn dominant_yaw_frac(&self) -> f32 {
-        let b = self.best();
-        self.fraction_within_yaw(b.2, self.cfg.locked_yaw_std_rad)
+        let a = self.cluster_anchor();
+        self.fraction_within_yaw(a.2, self.cfg.locked_yaw_std_rad)
     }
 
-    /// Mean pose of the dominant cluster (anchored on best particle).
-    /// Use this as the relocalize lock pose: more stable than `best()`
-    /// (which can hop between similar-weight particles inside the
-    /// cluster) and not pulled off-truth by secondary modes the way
-    /// `weighted_mean()` is.
+    /// Pose to commit when MCL locks: mean of the dominant cluster
+    /// (defined as particles within both radii of the densest bin).
     pub fn dominant_cluster_mean(&self) -> Pose2 {
-        let b = self.best();
-        self.cluster_mean(b.0, b.1, b.2,
+        let a = self.cluster_anchor();
+        self.cluster_mean(a.0, a.1, a.2,
                           self.cfg.locked_xy_std_m,
                           self.cfg.locked_yaw_std_rad)
     }
@@ -440,16 +445,16 @@ impl Localizer {
         }
 
         // Update lock streak based on dominant-cluster cohesion in
-        // BOTH (x, y) AND yaw, anchored on the best (highest-weight)
-        // particle. Anchoring on best rather than weighted_mean avoids
-        // the "mean falls in dead space between modes" failure for
-        // bi-modal clouds. Both fractions must clear
-        // `locked_dominant_frac`.
-        let best = self.best();
+        // BOTH (x, y) AND yaw, anchored on the centre of the densest
+        // (x, y, yaw) bin. This anchor is stable across frames — best()
+        // can hop between similar-weight particles inside a cluster
+        // and cause spurious streak resets, the densest-bin centre
+        // does not.
+        let anchor = self.cluster_anchor();
         let cluster_frac = self.fraction_within(
-            best.0, best.1, self.cfg.locked_xy_std_m);
+            anchor.0, anchor.1, self.cfg.locked_xy_std_m);
         let yaw_frac = self.fraction_within_yaw(
-            best.2, self.cfg.locked_yaw_std_rad);
+            anchor.2, self.cfg.locked_yaw_std_rad);
         let res_ok = self.last_residual_m.is_finite()
             && self.last_residual_m <= self.cfg.locked_max_residual_m;
         let spread_ok = cluster_frac >= self.cfg.locked_dominant_frac
@@ -537,6 +542,35 @@ impl Localizer {
             if wrap_pi(p.2 - yaw_c).abs() < yaw_radius_rad { n += 1; }
         }
         n as f32 / self.particles.len() as f32
+    }
+
+    /// Find the centre of the densest cluster by coarse binning.
+    /// Particles are dropped into (x, y, yaw) bins of size
+    /// `cell_m` × `cell_m` × `yaw_bin_rad`; the bin with the most
+    /// occupants is the dominant cluster. Returns its centre — which
+    /// is *stable across frames* even when individual particle weights
+    /// hop within a cluster, unlike `best()`.
+    ///
+    /// Trade-off: O(N) per call (sparse-hash binning); negligible at
+    /// our particle counts.
+    pub fn densest_bin_center(&self, cell_m: f32, yaw_bin_rad: f32) -> Pose2 {
+        use std::collections::HashMap;
+        if self.particles.is_empty() { return (0.0, 0.0, 0.0); }
+        let inv_cell = 1.0 / cell_m.max(1e-6);
+        let inv_yaw  = 1.0 / yaw_bin_rad.max(1e-6);
+        let mut counts: HashMap<(i32, i32, i32), u32> = HashMap::new();
+        for p in &self.particles {
+            let i = (p.0 * inv_cell).floor() as i32;
+            let j = (p.1 * inv_cell).floor() as i32;
+            let k = ((p.2 + std::f32::consts::PI) * inv_yaw).floor() as i32;
+            *counts.entry((i, j, k)).or_insert(0) += 1;
+        }
+        let ((bi, bj, bk), _) = counts.iter()
+            .max_by_key(|(_, &c)| c).unwrap();
+        let bx = (*bi as f32 + 0.5) * cell_m;
+        let by = (*bj as f32 + 0.5) * cell_m;
+        let byaw = (*bk as f32 + 0.5) * yaw_bin_rad - std::f32::consts::PI;
+        (bx, by, byaw)
     }
 
     /// Mean pose of particles within `radius_m` of `(bx, by)` and
