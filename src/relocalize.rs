@@ -14,7 +14,7 @@
 //! cells / `cfg.coarse_yaw_bins` bins, followed by a refinement pass at
 //! single-cell / fine-bin resolution around the best coarse candidate.
 
-use crate::grid::{OccupancyGrid, OCC_THRESHOLD};
+use crate::grid::OccupancyGrid;
 
 #[derive(Debug, Clone)]
 pub struct RelocalizeConfig {
@@ -34,6 +34,12 @@ pub struct RelocalizeConfig {
     /// Per-beam residual is clamped to this so a single very-far beam
     /// can't dominate the mean (matches the Hector saturation trick).
     pub clamp_m: f32,
+    /// Fixed-point log-odds threshold above which a cell counts as a
+    /// wall for the distance-field score. 0 = use every barely-positive
+    /// cell (legacy); ~200 = require 3+ net hits to confirm a wall, so
+    /// transient ToF flickers in the saved map don't pull the search
+    /// off-target.
+    pub wall_threshold_fp: i16,
 }
 
 impl Default for RelocalizeConfig {
@@ -52,6 +58,7 @@ impl Default for RelocalizeConfig {
             max_mean_residual_m: 0.05,
             min_beams_used:      24,
             clamp_m:             0.15,
+            wall_threshold_fp:   200,
         }
     }
 }
@@ -109,7 +116,7 @@ pub fn relocalize_against_grid(
 
     // Take a copy of the distance field so we can drop the mutable
     // borrow before the search loop accesses immutable grid methods.
-    let field = grid.distance_field(OCC_THRESHOLD).to_vec();
+    let field = grid.distance_field(cfg.wall_threshold_fp).to_vec();
     let cfg_g = *grid.cfg();
     let w = grid.width(); let h = grid.height();
     let cell = cfg_g.cell;
@@ -200,19 +207,24 @@ mod tests {
         let mut g = OccupancyGrid::new(GridConfig {
             x_range: (-2.5, 2.5), y_range: (-2.5, 2.5), cell: 0.05,
         });
-        // Outer walls.
+        // Outer walls — cast each ray a few times so the wall cells
+        // accumulate enough log-odds to clear a reasonable `wall_threshold_fp`.
         let n = 200;
-        for i in 0..n {
-            let t = -2.0 + 4.0 * (i as f32 / (n - 1) as f32);
-            g.integrate_ray(0.0, 0.0, t,  2.0, true);
-            g.integrate_ray(0.0, 0.0, t, -2.0, true);
-            g.integrate_ray(0.0, 0.0,  2.0, t, true);
-            g.integrate_ray(0.0, 0.0, -2.0, t, true);
+        for _ in 0..4 {
+            for i in 0..n {
+                let t = -2.0 + 4.0 * (i as f32 / (n - 1) as f32);
+                g.integrate_ray(0.0, 0.0, t,  2.0, true);
+                g.integrate_ray(0.0, 0.0, t, -2.0, true);
+                g.integrate_ray(0.0, 0.0,  2.0, t, true);
+                g.integrate_ray(0.0, 0.0, -2.0, t, true);
+            }
         }
         // Asymmetric divider.
-        for i in 0..n / 2 {
-            let t = 0.0 + 2.0 * (i as f32 / ((n / 2) as f32));
-            g.integrate_ray(0.0, 0.0, t, 0.5, true);
+        for _ in 0..4 {
+            for i in 0..n / 2 {
+                let t = 0.0 + 2.0 * (i as f32 / ((n / 2) as f32));
+                g.integrate_ray(0.0, 0.0, t, 0.5, true);
+            }
         }
         g
     }

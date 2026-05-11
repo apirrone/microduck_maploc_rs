@@ -21,7 +21,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Normal};
 
-use crate::grid::{OccupancyGrid, OCC_THRESHOLD};
+use crate::grid::OccupancyGrid;
 use crate::submap::Pose2;
 
 #[derive(Debug, Clone)]
@@ -56,6 +56,12 @@ pub struct MclConfig {
     /// a wrong-but-plausible cluster can capture the cloud and never
     /// release it.
     pub random_inject_frac: f32,
+    /// Fixed-point log-odds threshold above which a cell counts as a
+    /// wall for the distance-field likelihood. `OCC_THRESHOLD` (= 0)
+    /// reproduces the previous behaviour; bumping it up filters
+    /// transient noise — useful when the saved map is fuzzy. 200 ≈ "a
+    /// cell needed 3+ net hits to be a wall".
+    pub wall_threshold_fp: i16,
 }
 
 impl Default for MclConfig {
@@ -79,6 +85,7 @@ impl Default for MclConfig {
             locked_min_frames: 25,
             jitter_xy_m: 0.005,
             jitter_yaw_rad: 0.005,
+            wall_threshold_fp: 200,
         }
     }
 }
@@ -236,7 +243,7 @@ impl Localizer {
         let n_valid = ranges_horiz.iter().filter(|r| r.is_finite() && **r > 0.0).count();
         if (n_valid as u32) < self.cfg.min_beams_used { return; }
 
-        let field = grid.distance_field(OCC_THRESHOLD).to_vec();
+        let field = grid.distance_field(self.cfg.wall_threshold_fp).to_vec();
         let cfg_g = *grid.cfg();
         let w = grid.width(); let h = grid.height();
         let cell = cfg_g.cell;

@@ -24,10 +24,17 @@ pub struct GlobalRenderConfig {
     pub cell_m: f32,
     /// Padding around the union bbox, metres.
     pub margin_m: f32,
+    /// Per-submap cells are only composited when their |log-odds| is
+    /// above this threshold. 0 = include every barely-positive cell
+    /// (legacy, fuzzy walls). ~150 hides one-off ToF flickers without
+    /// erasing genuine walls.
+    pub min_hit_threshold_fp: i16,
 }
 
 impl Default for GlobalRenderConfig {
-    fn default() -> Self { Self { cell_m: 0.05, margin_m: 0.5 } }
+    fn default() -> Self {
+        Self { cell_m: 0.05, margin_m: 0.5, min_hit_threshold_fp: 150 }
+    }
 }
 
 /// Render the union of all submaps into a fresh global grid. Returns
@@ -88,6 +95,13 @@ pub fn render_global<'a>(
             for j in 0..lw {
                 let v = log[i * lw + j];
                 if v == 0 { continue; }
+                // Skip per-submap cells whose |log-odds| is below the
+                // configured threshold — keeps the global render from
+                // accumulating sub-threshold noise into a wall once it
+                // crosses zero in aggregate.
+                if v.unsigned_abs() < cfg.min_hit_threshold_fp.unsigned_abs() {
+                    continue;
+                }
                 let xl = cfg_l.x_range.0 + (j as f32 + 0.5) * cell_l;
                 let yl = cfg_l.y_range.0 + (i as f32 + 0.5) * cell_l;
                 let xw = ax + ca * xl - sa * yl;
@@ -112,14 +126,14 @@ mod tests {
             y_range: (-1.0, 1.0),
             cell:    0.05,
         };
-        // Submap A at (0, 0, 0): mark a wall at world (0.5, 0).
+        // Submap A at (0, 0, 0): mark a wall at world (0.5, 0). Repeat
+        // the same beam so the cell crosses the render confidence
+        // threshold (a single hit would otherwise be filtered as noise).
         let mut a = Submap::new_at((0.0, 0.0, 0.0), cfg);
-        a.integrate_scan((0.0, 0.0, 0.0), &[0.0], &[0.5]);
+        for _ in 0..5 { a.integrate_scan((0.0, 0.0, 0.0), &[0.0], &[0.5]); }
         // Submap B anchored at (0.5, 0, 0): same world wall is at LOCAL (0, 0).
-        // Body at (0.5, 0, 0) shoots a forward beam range 0.05 → marks the
-        // cell at world (0.55, 0). Slightly different but overlaps with A.
         let mut b = Submap::new_at((0.5, 0.0, 0.0), cfg);
-        b.integrate_scan((0.5, 0.0, 0.0), &[0.0], &[0.05]);
+        for _ in 0..5 { b.integrate_scan((0.5, 0.0, 0.0), &[0.0], &[0.05]); }
 
         let g = render_global([&a, &b], &GlobalRenderConfig::default()).unwrap();
         // World cell ~ (0.5, 0) should be marked occupied (positive log-odds)

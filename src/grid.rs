@@ -111,6 +111,15 @@ impl OccupancyGrid {
     /// True if this cell has been explicitly observed as free at least once.
     /// Useful for seeding MCL particles in known-free space.
     #[inline]
+    /// True iff the fixed-point log-odds at (i, j) exceed `threshold_fp`.
+    /// Lets callers ask "is this a *confident* wall?" without changing
+    /// global constants. The renderer / distance-field passes a value
+    /// here; the default `OCC_THRESHOLD` keeps backwards compatibility.
+    #[inline]
+    pub fn is_above_threshold(&self, i: usize, j: usize, threshold_fp: i16) -> bool {
+        self.log[i * self.w + j] > threshold_fp
+    }
+
     pub fn is_known_free(&self, i: usize, j: usize) -> bool {
         self.log[i * self.w + j] < -50  // ≈ 0.5 log-odds below 0
     }
