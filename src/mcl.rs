@@ -176,12 +176,34 @@ impl Localizer {
     pub fn n_particles(&self) -> usize { self.particles.len() }
     pub fn last_residual_m(&self) -> f32 { self.last_residual_m }
     pub fn locked_streak(&self) -> u32 { self.locked_streak }
-    /// Fraction of particles within `locked_xy_std_m` of the weighted
-    /// mean — same metric the lock-streak check uses. Exposed so the
-    /// runtime can log convergence progress.
+    /// Fraction of particles within `locked_xy_std_m` of the best
+    /// (highest-weight) particle. Anchoring on `best()` rather than
+    /// `weighted_mean()` is robust to bi-modal clouds — the mean of
+    /// two distinct modes falls in dead space between them, the best
+    /// particle is by definition inside the densest cluster.
     pub fn dominant_cluster_frac(&self) -> f32 {
-        let mean = self.weighted_mean();
-        self.fraction_within(mean.0, mean.1, self.cfg.locked_xy_std_m)
+        let b = self.best();
+        self.fraction_within(b.0, b.1, self.cfg.locked_xy_std_m)
+    }
+
+    /// Fraction of particles within `locked_yaw_std_rad` of the best
+    /// particle's yaw — the heading-axis analogue of
+    /// `dominant_cluster_frac`.
+    pub fn dominant_yaw_frac(&self) -> f32 {
+        let b = self.best();
+        self.fraction_within_yaw(b.2, self.cfg.locked_yaw_std_rad)
+    }
+
+    /// Mean pose of the dominant cluster (anchored on best particle).
+    /// Use this as the relocalize lock pose: more stable than `best()`
+    /// (which can hop between similar-weight particles inside the
+    /// cluster) and not pulled off-truth by secondary modes the way
+    /// `weighted_mean()` is.
+    pub fn dominant_cluster_mean(&self) -> Pose2 {
+        let b = self.best();
+        self.cluster_mean(b.0, b.1, b.2,
+                          self.cfg.locked_xy_std_m,
+                          self.cfg.locked_yaw_std_rad)
     }
 
     /// Spread particles uniformly over `grid`'s free cells with random
@@ -417,20 +439,21 @@ impl Localizer {
             }
         }
 
-        // Update lock streak based on dominant-cluster cohesion +
-        // best-particle residual AND demonstrated motion. Cohesion is
-        // measured as the fraction of particles within
-        // `locked_xy_std_m` of the weighted-mean pose — robust to
-        // secondary modes (a few stragglers don't keep the cloud from
-        // locking once 80% have committed to the right cluster).
-        let mean = self.weighted_mean();
+        // Update lock streak based on dominant-cluster cohesion in
+        // BOTH (x, y) AND yaw, anchored on the best (highest-weight)
+        // particle. Anchoring on best rather than weighted_mean avoids
+        // the "mean falls in dead space between modes" failure for
+        // bi-modal clouds. Both fractions must clear
+        // `locked_dominant_frac`.
+        let best = self.best();
         let cluster_frac = self.fraction_within(
-            mean.0, mean.1, self.cfg.locked_xy_std_m);
-        let yaw_std = self.yaw_std();
+            best.0, best.1, self.cfg.locked_xy_std_m);
+        let yaw_frac = self.fraction_within_yaw(
+            best.2, self.cfg.locked_yaw_std_rad);
         let res_ok = self.last_residual_m.is_finite()
             && self.last_residual_m <= self.cfg.locked_max_residual_m;
         let spread_ok = cluster_frac >= self.cfg.locked_dominant_frac
-                     && yaw_std <= self.cfg.locked_yaw_std_rad;
+                     && yaw_frac     >= self.cfg.locked_dominant_frac;
         let motion_ok = self.motion_since_streak_m
                           >= self.cfg.lock_min_motion_per_streak_m
                      || self.rotation_since_streak_rad
@@ -490,10 +513,9 @@ impl Localizer {
         (var / n).sqrt()
     }
 
-    /// Fraction of particles within `radius_m` of `(cx, cy)`. Use with
-    /// `weighted_mean()` to test "is the cloud's dominant cluster
-    /// tight?" — much more robust than `position_std()` when the cloud
-    /// has secondary modes.
+    /// Fraction of particles within `radius_m` of `(cx, cy)`. Used to
+    /// measure dominant-cluster cohesion when anchored on a known good
+    /// center (best particle).
     pub fn fraction_within(&self, cx: f32, cy: f32, radius_m: f32) -> f32 {
         if self.particles.is_empty() { return 0.0; }
         let r2 = radius_m * radius_m;
@@ -503,6 +525,41 @@ impl Localizer {
             if dx * dx + dy * dy < r2 { n += 1; }
         }
         n as f32 / self.particles.len() as f32
+    }
+
+    /// Fraction of particles within `yaw_radius_rad` of `yaw_c` on the
+    /// circle. Used alongside `fraction_within` to detect when the
+    /// dominant cluster is *also* tight in yaw, not just position.
+    pub fn fraction_within_yaw(&self, yaw_c: f32, yaw_radius_rad: f32) -> f32 {
+        if self.particles.is_empty() { return 0.0; }
+        let mut n = 0usize;
+        for p in &self.particles {
+            if wrap_pi(p.2 - yaw_c).abs() < yaw_radius_rad { n += 1; }
+        }
+        n as f32 / self.particles.len() as f32
+    }
+
+    /// Mean pose of particles within `radius_m` of `(bx, by)` and
+    /// within `yaw_radius_rad` of `byaw`. Use this to snap to the
+    /// dominant cluster after lock — it ignores secondary-mode
+    /// stragglers that would pull `weighted_mean()` off-truth.
+    pub fn cluster_mean(&self, bx: f32, by: f32, byaw: f32,
+                        radius_m: f32, yaw_radius_rad: f32) -> Pose2 {
+        let r2 = radius_m * radius_m;
+        let mut x = 0.0_f32; let mut y = 0.0_f32;
+        let mut sx = 0.0_f32; let mut cyy = 0.0_f32;
+        let mut n = 0usize;
+        for p in &self.particles {
+            let dx = p.0 - bx; let dy = p.1 - by;
+            if dx * dx + dy * dy >= r2 { continue; }
+            if wrap_pi(p.2 - byaw).abs() >= yaw_radius_rad { continue; }
+            x += p.0; y += p.1;
+            sx += p.2.sin(); cyy += p.2.cos();
+            n += 1;
+        }
+        if n == 0 { return (bx, by, byaw); }
+        let nf = n as f32;
+        (x / nf, y / nf, sx.atan2(cyy))
     }
 
     pub fn yaw_std(&self) -> f32 {
