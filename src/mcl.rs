@@ -459,23 +459,16 @@ impl Localizer {
             && self.last_residual_m <= self.cfg.locked_max_residual_m;
         let spread_ok = cluster_frac >= self.cfg.locked_dominant_frac
                      && yaw_frac     >= self.cfg.locked_dominant_frac;
-        let motion_ok = self.motion_since_streak_m
-                          >= self.cfg.lock_min_motion_per_streak_m
-                     || self.rotation_since_streak_rad
-                          >= self.cfg.lock_min_rotation_per_streak_rad;
-        if res_ok && spread_ok && motion_ok {
+        // Streak counts consecutive frames of cluster + residual
+        // cohesion. The motion requirement is enforced separately by
+        // the runtime (total net world-frame travel since search
+        // start), so an MCL per-step motion gate would just double-
+        // count and starve when odom goes quiet after a walk.
+        if res_ok && spread_ok {
             self.locked_streak += 1;
-            self.motion_since_streak_m = 0.0;
-            self.rotation_since_streak_rad = 0.0;
-        } else if !res_ok || !spread_ok {
-            // Bad fit / wide cloud → reset streak. Keep motion
-            // accumulating so a stationary duck that suddenly walks
-            // doesn't have to wait for a fresh motion budget.
+        } else {
             self.locked_streak = 0;
         }
-        // res_ok && spread_ok but no motion yet → don't increment, but
-        // don't reset either. Cloud stays tentatively narrow until the
-        // duck moves enough to validate.
     }
 
     /// Highest-weight particle.
