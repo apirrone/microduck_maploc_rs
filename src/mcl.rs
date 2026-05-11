@@ -83,6 +83,12 @@ pub struct MclConfig {
     /// collapse on frame 1 to whichever wrong cluster fit best. After
     /// the grace period, normal ESS-based resampling resumes.
     pub min_updates_before_resample: u32,
+    /// Required fraction of particles within `locked_xy_std_m` of the
+    /// weighted-mean pose for the cloud to count as "locked". Robust to
+    /// minor multi-modal stragglers: once the dominant cluster has this
+    /// fraction, the few outliers don't block lock. Set to 1.0 to fall
+    /// back to "all particles tight" behaviour.
+    pub locked_dominant_frac: f32,
 }
 
 impl Default for MclConfig {
@@ -95,7 +101,7 @@ impl Default for MclConfig {
             sigma_yaw_per_rad: 0.10,
             beam_sigma_m: 0.20,
             beam_clamp_m: 0.50,
-            random_inject_frac: 0.05,
+            random_inject_frac: 0.10,
             min_beams_used: 16,
             resample_ess_frac: 0.5,
             locked_xy_std_m: 0.15,
@@ -108,10 +114,12 @@ impl Default for MclConfig {
             jitter_yaw_rad: 0.005,
             wall_threshold_fp: 200,
             // Soften the posterior. With 64 beams and σ=0.20 m the
-            // raw posterior spans ~200 nats; temper=0.15 compresses
-            // that to ~30, so multiple competing modes survive instead
-            // of collapsing onto whichever cluster fit slightly best.
-            likelihood_temper: 0.15,
+            // raw posterior spans ~200 nats; temper=0.30 compresses
+            // that to ~60 per frame, but multiplied across 5 grace
+            // frames (`min_updates_before_resample`) the effective
+            // discrimination is plenty to commit cleanly while still
+            // letting competing modes survive past frame 1.
+            likelihood_temper: 0.30,
             // Motion gating: see `relocalize_start_odom` plumbing in
             // the runtime. These values are still consulted as a
             // *lower bound* inside MCL but the runtime applies a
@@ -122,6 +130,9 @@ impl Default for MclConfig {
             // across updates so the cloud commits only after multiple
             // frames of consistent evidence.
             min_updates_before_resample: 5,
+            // 80% of particles in the dominant cluster is enough; the
+            // remaining 20% can stragglers from secondary modes.
+            locked_dominant_frac: 0.80,
         }
     }
 }
@@ -165,6 +176,13 @@ impl Localizer {
     pub fn n_particles(&self) -> usize { self.particles.len() }
     pub fn last_residual_m(&self) -> f32 { self.last_residual_m }
     pub fn locked_streak(&self) -> u32 { self.locked_streak }
+    /// Fraction of particles within `locked_xy_std_m` of the weighted
+    /// mean — same metric the lock-streak check uses. Exposed so the
+    /// runtime can log convergence progress.
+    pub fn dominant_cluster_frac(&self) -> f32 {
+        let mean = self.weighted_mean();
+        self.fraction_within(mean.0, mean.1, self.cfg.locked_xy_std_m)
+    }
 
     /// Spread particles uniformly over `grid`'s free cells with random
     /// yaw. Falls back to (0, 0, *) if the grid has no free cells (e.g.
@@ -399,16 +417,19 @@ impl Localizer {
             }
         }
 
-        // Update lock streak based on cloud spread + best-particle
-        // residual AND demonstrated motion since the last streak step.
-        // A stationary duck whose cloud collapsed on a wrong cluster
-        // would otherwise streak forever and lock — motion is the only
-        // signal that can disambiguate a 45° FOV.
-        let xy_std = self.position_std();
+        // Update lock streak based on dominant-cluster cohesion +
+        // best-particle residual AND demonstrated motion. Cohesion is
+        // measured as the fraction of particles within
+        // `locked_xy_std_m` of the weighted-mean pose — robust to
+        // secondary modes (a few stragglers don't keep the cloud from
+        // locking once 80% have committed to the right cluster).
+        let mean = self.weighted_mean();
+        let cluster_frac = self.fraction_within(
+            mean.0, mean.1, self.cfg.locked_xy_std_m);
         let yaw_std = self.yaw_std();
         let res_ok = self.last_residual_m.is_finite()
             && self.last_residual_m <= self.cfg.locked_max_residual_m;
-        let spread_ok = xy_std <= self.cfg.locked_xy_std_m
+        let spread_ok = cluster_frac >= self.cfg.locked_dominant_frac
                      && yaw_std <= self.cfg.locked_yaw_std_rad;
         let motion_ok = self.motion_since_streak_m
                           >= self.cfg.lock_min_motion_per_streak_m
@@ -467,6 +488,21 @@ impl Localizer {
             var += dx * dx + dy * dy;
         }
         (var / n).sqrt()
+    }
+
+    /// Fraction of particles within `radius_m` of `(cx, cy)`. Use with
+    /// `weighted_mean()` to test "is the cloud's dominant cluster
+    /// tight?" — much more robust than `position_std()` when the cloud
+    /// has secondary modes.
+    pub fn fraction_within(&self, cx: f32, cy: f32, radius_m: f32) -> f32 {
+        if self.particles.is_empty() { return 0.0; }
+        let r2 = radius_m * radius_m;
+        let mut n = 0usize;
+        for p in &self.particles {
+            let dx = p.0 - cx; let dy = p.1 - cy;
+            if dx * dx + dy * dy < r2 { n += 1; }
+        }
+        n as f32 / self.particles.len() as f32
     }
 
     pub fn yaw_std(&self) -> f32 {
